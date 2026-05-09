@@ -52,6 +52,8 @@ from .pi0.configuration_pi0 import PI0Config
 from .pi05.configuration_pi05 import PI05Config
 from .pretrained import PreTrainedPolicy
 from .sac.configuration_sac import SACConfig
+from .sawseenvla.configuration_sawseenvla import SawSeenVLAConfig
+from .sawseenvlawm.configuration_sawseenvlawm import SawSeenVLAWMConfig
 from .smolvla.configuration_smolvla import SmolVLAConfig
 from .tdmpc.configuration_tdmpc import TDMPCConfig
 from .utils import validate_visual_features_consistency
@@ -87,7 +89,7 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
 
     Args:
         name: The name of the policy. Supported names are "tdmpc", "diffusion", "act",
-            "multi_task_dit", "vqbet", "pi0", "pi05", "sac", "smolvla", "wall_x".
+            "multi_task_dit", "vqbet", "pi0", "pi05", "sac", "smolvla", "sawseenvla", "wall_x".
     Returns:
         The policy class corresponding to the given name.
 
@@ -134,6 +136,14 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from .smolvla.modeling_smolvla import SmolVLAPolicy
 
         return SmolVLAPolicy
+    elif name == "sawseenvla":
+        from .sawseenvla.modeling_sawseenvla import SawSeenVLAPolicy
+
+        return SawSeenVLAPolicy
+    elif name == "sawseenvlawm":
+        from .sawseenvlawm.modeling_sawseenvlawm import SawSeenVLAWMPolicy
+
+        return SawSeenVLAWMPolicy
     elif name == "groot":
         from .groot.modeling_groot import GrootPolicy
 
@@ -163,7 +173,7 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
     Args:
         policy_type: The type of the policy. Supported types include "tdmpc",
                      "multi_task_dit", "diffusion", "act", "vqbet", "pi0", "pi05", "sac",
-                     "smolvla", "wall_x".
+                     "smolvla", "sawseenvla", "wall_x".
         **kwargs: Keyword arguments to be passed to the configuration class constructor.
 
     Returns:
@@ -190,6 +200,10 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return SACConfig(**kwargs)
     elif policy_type == "smolvla":
         return SmolVLAConfig(**kwargs)
+    elif policy_type == "sawseenvla":
+        return SawSeenVLAConfig(**kwargs)
+    elif policy_type == "sawseenvlawm":
+        return SawSeenVLAWMConfig(**kwargs)
     elif policy_type == "groot":
         return GrootConfig(**kwargs)
     elif policy_type == "xvla":
@@ -370,6 +384,22 @@ def make_pre_post_processors(
         from .smolvla.processor_smolvla import make_smolvla_pre_post_processors
 
         processors = make_smolvla_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
+    elif isinstance(policy_cfg, SawSeenVLAWMConfig):
+        from .sawseenvlawm.processor_sawseenvlawm import make_sawseenvlawm_pre_post_processors
+
+        processors = make_sawseenvlawm_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
+    elif isinstance(policy_cfg, SawSeenVLAConfig):
+        from .sawseenvla.processor_sawseenvla import make_sawseenvla_pre_post_processors
+
+        processors = make_sawseenvla_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )
