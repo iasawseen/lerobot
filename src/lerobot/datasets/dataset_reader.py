@@ -110,6 +110,29 @@ class DatasetReader:
         if self.episodes is not None and self.hf_dataset is not None:
             indices = self.hf_dataset.data.column("index").to_numpy()
             self._absolute_to_relative_idx = dict(zip(indices.tolist(), range(len(indices)), strict=True))
+        self._build_query_views()
+
+    def _build_query_views(self) -> None:
+        """Build per-key narrow column views for delta-timestamp lookups.
+
+        HF `datasets`' batch fetch decodes every Image-typed column on the fetched rows
+        regardless of which column you actually accessed. For policies with action
+        delta_timestamps (e.g. SmolVLA's chunk_size=50), that means decoding ~50× more
+        PNGs per sample than the policy ever consumes. By restricting the view to just
+        the needed column, the Image columns are out of scope and never decoded.
+        """
+        self._query_views: dict[str, datasets.Dataset] = {}
+        if self.hf_dataset is None or self.delta_indices is None:
+            return
+        for key in self.delta_indices.keys():
+            if key in self._meta.video_keys:
+                continue
+            try:
+                view = self.hf_dataset.select_columns([key])
+            except (KeyError, ValueError):
+                continue
+            view.set_transform(hf_transform_to_torch)
+            self._query_views[key] = view
 
     @property
     def num_frames(self) -> int:
@@ -224,10 +247,13 @@ class DatasetReader:
                 if self._absolute_to_relative_idx is None
                 else [self._absolute_to_relative_idx[idx] for idx in q_idx]
             )
+            # Use the narrow per-key view built in `_build_query_views` to avoid
+            # decoding Image-typed columns on rows where we only need this key.
+            view = self._query_views.get(key, self.hf_dataset)
             try:
-                result[key] = torch.stack(self.hf_dataset[key][relative_indices])
+                result[key] = torch.stack(view[key][relative_indices])
             except (KeyError, TypeError, IndexError):
-                result[key] = torch.stack(self.hf_dataset[relative_indices][key])
+                result[key] = torch.stack(view[relative_indices][key])
         return result
 
     def _query_videos(self, query_timestamps: dict[str, list[float]], ep_idx: int) -> dict[str, torch.Tensor]:

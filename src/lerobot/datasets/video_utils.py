@@ -17,6 +17,7 @@ import contextlib
 import glob
 import importlib
 import logging
+import os
 import queue
 import shutil
 import tempfile
@@ -282,7 +283,8 @@ class VideoDecoderCache:
         with self._lock:
             if video_path not in self._cache:
                 file_handle = fsspec.open(video_path).__enter__()
-                decoder = VideoDecoder(file_handle, seek_mode="approximate")
+                _ffmpeg_threads = int(os.environ.get("TORCHCODEC_NUM_FFMPEG_THREADS", "1"))
+                decoder = VideoDecoder(file_handle, seek_mode="approximate", num_ffmpeg_threads=_ffmpeg_threads)
                 self._cache[video_path] = (decoder, file_handle)
 
             return self._cache[video_path][0]
