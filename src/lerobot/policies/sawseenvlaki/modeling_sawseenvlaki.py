@@ -16,12 +16,18 @@
 
 Same flow-matching action expert as SawSeenVLA, plus:
 
-1. ``fast_embed`` (Embedding(fast_vocab_size, d_vlm)) and ``fast_head``
-   (Linear(d_vlm, fast_vocab_size)) — dedicated input/output
-   projections that live OUTSIDE the SmolVLM2 vocab. SmolVLM2 has
-   untied embeddings (~47 M params each); putting them in
-   ``modules_to_save`` would bloat trainable params by ~95 M and OOM
-   24 GB cards.
+1. ``fast_embed`` (Embedding(fast_vocab_size, d_vlm)) — dedicated
+   input projection for FAST tokens, fully trainable via
+   ``modules_to_save``. The output projection reuses the VLM's
+   existing ``lm_head`` (sliced over the last ``fast_vocab_size``
+   rows) with LoRA adapters, so the FAST CE flows through
+   pretrained text-vocabulary geometry that the LoRA deforms —
+   closer in spirit to the π0.5 / π0.6 recipe than a fully-random
+   output head. SmolVLM2 has untied 47 M-param embed/head matrices,
+   so naive vocab extension via ``modules_to_save`` would add ~95 M
+   trainable params and OOM 24 GB cards; the dedicated
+   ``fast_embed`` + sliced ``lm_head`` path costs only ~2 M (embed)
+   + ~0.8 M (lm_head LoRA at r=16).
 
 2. FAST tokens enter the prefix between language and state with
    ``att_mask=[1, 1, ..., 1]`` so each FAST token is its own block —
@@ -31,8 +37,10 @@ Same flow-matching action expert as SawSeenVLA, plus:
 
 3. A ``.detach()`` boundary on the VLM K/V tensors going into the
    action expert (via ``detach_kv_for_expert=True`` on the wrapper
-   forward) is added in a follow-up step. With KI off the policy is
-   structurally equivalent to SawSeenVLA.
+   forward) keeps the flow-matching gradient from updating the
+   VLM — only the FAST CE updates VLM weights, through LoRA
+   adapters on text_model q/v and on lm_head. With KI off the
+   policy is structurally equivalent to SawSeenVLA.
 """
 
 import math
@@ -70,14 +78,20 @@ class VLAFlowMatchingKI(VLAFlowMatching):
         super().__init__(config, rtc_processor=rtc_processor)
         self.config = config  # type: SawSeenVLAKIConfig
         d_vlm = self.vlm_with_expert.config.text_config.hidden_size
-        # Dedicated FAST input/output projections — outside the SmolVLM2
-        # vocab. ``fast_embed(token_id)`` produces an embedding in the
-        # VLM hidden space that is consumed by the transformer like any
-        # language token; ``fast_head(h_t)`` projects last-layer hidden
-        # states at FAST positions to next-token logits over the FAST
-        # vocabulary.
+        # Dedicated FAST INPUT projection. ``fast_embed(token_id)``
+        # produces an embedding in the VLM hidden space that is
+        # consumed by the transformer like any language token. The
+        # corresponding OUTPUT projection reuses the VLM's existing
+        # ``lm_head`` — see ``forward_ki`` — so the lm_head's
+        # LoRA-adapted rows over the last ``fast_vocab_size`` indices
+        # serve as the next-FAST-token classifier.
         self.fast_embed = nn.Embedding(self.config.fast_vocab_size, d_vlm)
-        self.fast_head = nn.Linear(d_vlm, self.config.fast_vocab_size)
+        # Index of the first row of ``vlm.lm_head`` that we treat as
+        # FAST token ID 0. Tail of the SmolLM2 vocab — token IDs there
+        # are real (rare) BPE pieces; with LoRA those rows can deform
+        # to align with FAST-token directions.
+        vocab_size = int(self.vlm_with_expert.vlm.config.text_config.vocab_size)
+        self._fast_id_offset = vocab_size - self.config.fast_vocab_size
 
     # ------------------------------------------------------------------
     # Prefix construction with FAST tokens spliced between lang & state.
@@ -270,8 +284,20 @@ class VLAFlowMatchingKI(VLAFlowMatching):
 
         # ---- CE loss on FAST positions ----
         # Hidden states at FAST positions: prefix_out[:, fast_start:fast_end].
-        fast_hidden = prefix_out[:, fast_start:fast_end]
-        fast_logits = self.fast_head(fast_hidden.to(dtype=torch.float32))
+        # Project via the VLM's lm_head, then slice to the FAST range
+        # before softmax. ``fast_token_ids`` arrive in [0, fast_vocab_size);
+        # the matching logits live at lm_head rows
+        # [_fast_id_offset, _fast_id_offset + fast_vocab_size). Slicing
+        # before CE means we don't pay the softmax cost over ~49k IDs
+        # nor backprop a "suppress non-FAST logits" gradient at FAST
+        # positions (those positions never produce text tokens — the
+        # FAST and text vocabularies are disjoint by convention).
+        fast_hidden = prefix_out[:, fast_start:fast_end].to(dtype=torch.float32)
+        lm_head = self.vlm_with_expert.vlm.lm_head
+        full_logits = lm_head(fast_hidden)
+        fast_logits = full_logits[
+            ..., self._fast_id_offset : self._fast_id_offset + self.config.fast_vocab_size
+        ]
         # Shifted targets: logits[:, :-1] predict tokens[:, 1:].
         # Loss mask: we count a position only if BOTH the input token
         # at that position AND the target (next) token were real
@@ -391,14 +417,24 @@ class SawSeenVLAKIPolicy(SawSeenVLAPolicy):
         return total, loss_dict
 
     # ------------------------------------------------------------------
-    # PEFT targets: same regex as SawSeenVLA + the new FAST modules in
-    # ``modules_to_save`` so they train fully under LoRA.
+    # PEFT targets: SawSeenVLA's text_model q/v regex + ``lm_head`` (so
+    # the FAST CE flows through LoRA-adapted output rows) + the
+    # ``fast_embed`` module in ``modules_to_save`` (it has no
+    # pretrained init to LoRA against).
     # ------------------------------------------------------------------
     def _get_default_peft_targets(self) -> dict[str, any]:
         targets = super()._get_default_peft_targets()
+        if self.config.ki_enabled:
+            # Extend target_modules to also LoRA-wrap ``lm_head``.
+            # ~0.8 M LoRA params at r=16 (Linear(960, 49280) → A(960,r)
+            # + B(r, 49280)). Compared to dropping a fully-trainable
+            # 2 M ``fast_head`` Linear, this is a net −1.2 M trainable.
+            targets["target_modules"] = (
+                r"model\.vlm_with_expert\.vlm\."
+                r"(model\.text_model\..*\.self_attn\.(q|v)_proj|lm_head)"
+            )
         modules_to_save = list(targets.get("modules_to_save", []))
-        for m in ("fast_embed", "fast_head"):
-            if m not in modules_to_save:
-                modules_to_save.append(m)
+        if "fast_embed" not in modules_to_save:
+            modules_to_save.append("fast_embed")
         targets["modules_to_save"] = modules_to_save
         return targets

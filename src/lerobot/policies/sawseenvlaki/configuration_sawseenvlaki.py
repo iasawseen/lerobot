@@ -129,12 +129,13 @@ class SawSeenVLAKIConfig(PreTrainedConfig):
     fast_action_tokenizer_path: str = "lerobot/fast-action-tokenizer"
     # Maximum number of FAST tokens per chunk. Variable-length output
     # from the tokenizer is right-padded to this length; the loss masks
-    # the padded positions. The released
-    # ``lerobot/fast-action-tokenizer`` outputs ~30-40 tokens per
-    # 7-D × 10-step chunk and grows with chunk_size; we leave headroom
-    # for chunk_size=50 (SawSeenVLA default) and noisy initial
-    # tokenization. A truncation warning fires if exceeded.
-    fast_max_action_tokens: int = 256
+    # the padded positions. Real LIBERO chunks (chunk_size=50,
+    # action_dim=7) span 100-145 tokens depending on content; 160
+    # covers the tail with margin and a truncation warning fires past
+    # that. Bumping this directly grows the VLM prefix and
+    # quadratically raises attention memory — re-tune ``batch_size``
+    # if you change it.
+    fast_max_action_tokens: int = 160
     # Size of the FAST action vocabulary. The released
     # ``lerobot/fast-action-tokenizer`` (``UniversalActionProcessor``)
     # exposes ``vocab_size=2048`` (256 reserved + 1792 BPE merges).

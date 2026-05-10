@@ -25,17 +25,22 @@ GPU            ?=
 
 # Train
 DATASET_REPO   ?= HuggingFaceVLA/libero
-OUTPUT_DIR     ?= outputs/train/sawseenvlaki_lora_r_16_libero_10k_bs64_2xGPUs_bf16
+OUTPUT_DIR     ?= outputs/train/sawseenvlaki_lora_r_16_libero_24k_bs32_2xGPUs_bf16
 JOB_NAME       ?= sawseenvlaki_libero
-STEPS          ?= 10000
-BATCH_SIZE     ?= 64
+STEPS          ?= 24000
+# bs=32 (vs sawseenvla bs=64) compensates for the FAST tokens
+# extending the prefix from ~113 to ~193 (with FAST_MAX_TOKENS=80) —
+# attention is quadratic in seq, so the per-sample activation budget
+# roughly doubles. Drop further if you bump FAST_MAX_TOKENS or
+# chunk_size.
+BATCH_SIZE     ?= 32
 NUM_WORKERS    ?= 4
 SAVE_FREQ      ?= 1000
 LOG_FREQ       ?= 100
 # Sqrt-scaled from the bs64 baseline (LR=4e-4 at global_batch=128):
-# LR ≈ 4e-4 × sqrt(global_batch/128). Default tuned for BATCH_SIZE=64
-# NUM_GPUS=2 (global_batch=128 → LR=4.0e-4).
-LR             ?= 4.0e-4
+# LR ≈ 4e-4 × sqrt(global_batch/128). Default tuned for BATCH_SIZE=32
+# NUM_GPUS=2 (global_batch=64 → LR=2.83e-4).
+LR             ?= 2.83e-4
 COMPILE_MODEL   ?= false
 COMPILE_MODE    ?= max-autotune
 PAD_LANGUAGE_TO ?= max_length
@@ -57,7 +62,13 @@ LORA_R           ?= 16
 # collide).
 KI               ?= true
 KI_LOSS_WEIGHT   ?= 1.0
-FAST_MAX_TOKENS  ?= 256
+# Right-pad bound for the FAST token sequence per chunk. Real lengths
+# for LIBERO chunks (chunk_size=50, action_dim=7) span 100-145 tokens
+# depending on chunk content; 160 covers the tail with margin and a
+# truncation warning fires past that. Bumping this directly grows the
+# VLM prefix and quadratically raises attention memory — re-tune
+# BATCH_SIZE if you change this.
+FAST_MAX_TOKENS  ?= 180
 FAST_VOCAB_SIZE  ?= 2048
 
 TRAIN_LAUNCHER  = $(if $(filter-out 1,$(NUM_GPUS)),accelerate launch --multi_gpu --num_processes=$(NUM_GPUS) --mixed_precision=$(MIXED_PRECISION) -m lerobot.scripts.lerobot_train,lerobot-train)
