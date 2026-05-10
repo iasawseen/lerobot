@@ -58,6 +58,7 @@ from ..pretrained import PreTrainedPolicy
 from ..rtc.modeling_rtc import RTCProcessor
 # The SmolVLM2 backbone wrapper is generic and shared with SmolVLA.
 from ..smolvla.smolvlm_with_expert import SmolVLMWithExpertModel
+from .smolvlm_with_two_experts import SmolVLMWithTwoExpertsModel
 from ..utils import (
     populate_queues,
 )
@@ -371,7 +372,17 @@ class SawSeenVLAWMPolicy(PreTrainedPolicy):
         actions = self.prepare_action(batch)
         actions_is_pad = batch.get("action_is_pad")
         loss_dict = {}
-        losses = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions, noise, time)
+
+        chunk_end_images = None
+        chunk_end_pad_mask = None
+        if self.config.lgp_enabled:
+            chunk_end_images, chunk_end_pad_mask = self.prepare_chunk_end_images(batch)
+
+        losses, lgp_loss = self.model.forward(
+            images, img_masks, lang_tokens, lang_masks, state, actions, noise, time,
+            chunk_end_images=chunk_end_images,
+            chunk_end_pad_mask=chunk_end_pad_mask,
+        )
         original_action_dim = self.config.action_feature.shape[0]
         losses = losses[:, :, :original_action_dim]
         loss_dict["losses_after_forward"] = losses.clone().mean().item()
@@ -392,15 +403,26 @@ class SawSeenVLAWMPolicy(PreTrainedPolicy):
             else:
                 num_valid = ((~actions_is_pad).sum(dim=1) * losses.shape[-1]).clamp_min(1)
                 per_sample_loss = losses.sum(dim=(1, 2)) / num_valid
+            # LGP loss is a scalar; broadcast it to per-sample for the
+            # weighted-sum convention used by sample_weighter consumers.
+            if lgp_loss is not None:
+                per_sample_loss = per_sample_loss + self.config.lgp_loss_weight * lgp_loss
+                loss_dict["loss_lgp"] = lgp_loss.item()
             loss_dict["loss"] = per_sample_loss.mean().item()
             return per_sample_loss, loss_dict
         else:
             # Default: return scalar mean loss over valid (time, action) entries
             if actions_is_pad is None:
-                loss = losses.mean()
+                loss_action = losses.mean()
             else:
                 num_valid = ((~actions_is_pad).sum() * losses.shape[-1]).clamp_min(1)
-                loss = losses.sum() / num_valid
+                loss_action = losses.sum() / num_valid
+            loss_dict["loss_action"] = loss_action.item()
+            if lgp_loss is not None:
+                loss = loss_action + self.config.lgp_loss_weight * lgp_loss
+                loss_dict["loss_lgp"] = lgp_loss.item()
+            else:
+                loss = loss_action
             loss_dict["loss"] = loss.item()
             return loss, loss_dict
 
@@ -417,9 +439,14 @@ class SawSeenVLAWMPolicy(PreTrainedPolicy):
             raise ValueError(
                 f"All image features are missing from the batch. At least one expected. (batch: {batch.keys()}) (image_features:{self.config.image_features})"
             )
-        # Preprocess image features present in the batch
+        # Preprocess image features present in the batch.
+        # When ``observation_delta_indices = [0, chunk_size]`` (LGP
+        # enabled) the obs stack is shape (B, 2, C, H, W) with index 0 the
+        # anchor frame and index 1 the chunk-end frame. We always take the
+        # anchor at index 0 here; ``prepare_chunk_end_images`` reads index 1
+        # separately for the LGP regression target.
         for key in present_img_keys:
-            img = batch[key][:, -1, :, :, :] if batch[key].ndim == 5 else batch[key]
+            img = batch[key][:, 0, :, :, :] if batch[key].ndim == 5 else batch[key]
             if self.config.resize_imgs_with_padding is not None:
                 img = resize_with_pad(img, *self.config.resize_imgs_with_padding, pad_value=0)
 
@@ -473,9 +500,52 @@ class SawSeenVLAWMPolicy(PreTrainedPolicy):
             actions[:, :, motor_idx] = aloha_gripper_from_angular_inv(actions[:, :, motor_idx])
         return actions
 
+    def prepare_chunk_end_images(self, batch):
+        """Extract and preprocess the chunk-end frame for LGP.
+
+        Mirrors ``prepare_images`` but reads index 1 (the o_{t+chunk_size}
+        frame) and additionally returns a per-sample boolean mask marking
+        samples whose chunk-end fell past the episode boundary (so the
+        dataset returned padded frames). The LGP loss masks those out.
+
+        Returns ``(images, chunk_end_pad_mask)`` where ``chunk_end_pad_mask``
+        has shape ``(B,)`` and is True for samples to drop from the LGP loss.
+        """
+        images = []
+        per_camera_pads = []
+        present_img_keys = [key for key in self.config.image_features if key in batch]
+        if len(present_img_keys) == 0:
+            raise ValueError(
+                "No image features in the batch — cannot extract chunk-end frame for LGP."
+            )
+        for key in present_img_keys:
+            if batch[key].ndim != 5 or batch[key].shape[1] < 2:
+                raise ValueError(
+                    f"LGP expects observation stack shape (B, 2, C, H, W) for "
+                    f"{key}, got {tuple(batch[key].shape)}. Confirm "
+                    f"observation_delta_indices=[0, chunk_size]."
+                )
+            img = batch[key][:, 1, :, :, :]
+            if self.config.resize_imgs_with_padding is not None:
+                img = resize_with_pad(img, *self.config.resize_imgs_with_padding, pad_value=0)
+            img = img * 2.0 - 1.0
+            images.append(img)
+            is_pad_key = f"{key}_is_pad"
+            if is_pad_key in batch:
+                per_camera_pads.append(batch[is_pad_key][:, 1])
+
+        chunk_end_pad_mask = None
+        if per_camera_pads:
+            chunk_end_pad_mask = per_camera_pads[0]
+            for p in per_camera_pads[1:]:
+                chunk_end_pad_mask = chunk_end_pad_mask | p
+        return images, chunk_end_pad_mask
+
     def prepare_state(self, batch):
-        """Pad state"""
-        state = batch[OBS_STATE][:, -1, :] if batch[OBS_STATE].ndim > 2 else batch[OBS_STATE]
+        """Pad state. Index 0 is the anchor frame; LGP-mode chunk-end state
+        at index 1 is intentionally discarded — it's the *outcome* of the
+        actions and isn't an input."""
+        state = batch[OBS_STATE][:, 0, :] if batch[OBS_STATE].ndim > 2 else batch[OBS_STATE]
         state = pad_vector(state, self.config.max_state_dim)
         return state
 
@@ -557,7 +627,11 @@ class VLAFlowMatching(nn.Module):
         super().__init__()
         self.config = config
 
-        self.vlm_with_expert = SmolVLMWithExpertModel(
+        # When LGP is enabled, the wrapper holds a second flow-matching
+        # expert (lgp_expert) parallel to the action expert. Both experts share
+        # only the VLM backbone — separate weights, separate projections, same
+        # per-layer interleaving as today's single-expert path.
+        wrapper_kwargs = dict(
             model_id=self.config.vlm_model_name,
             freeze_vision_encoder=self.config.freeze_vision_encoder,
             train_expert_only=self.config.train_expert_only,
@@ -569,6 +643,14 @@ class VLAFlowMatching(nn.Module):
             expert_width_multiplier=self.config.expert_width_multiplier,
             device=self.config.device if self.config.device is not None else "auto",
         )
+        if self.config.lgp_enabled:
+            self.vlm_with_expert = SmolVLMWithTwoExpertsModel(
+                **wrapper_kwargs,
+                lgp_expert_width_multiplier=self.config.lgp_expert_width_multiplier,
+                lgp_num_expert_layers=self.config.lgp_num_expert_layers,
+            )
+        else:
+            self.vlm_with_expert = SmolVLMWithExpertModel(**wrapper_kwargs)
         self.state_proj = nn.Linear(
             self.config.max_state_dim, self.vlm_with_expert.config.text_config.hidden_size
         )
@@ -582,16 +664,46 @@ class VLAFlowMatching(nn.Module):
             self.vlm_with_expert.expert_hidden_size, self.vlm_with_expert.expert_hidden_size
         )
 
+        # LGP projections — only built when the flag is on. The LGP
+        # expert emits a 192-dim velocity (le-wm latent dim), so its in/out
+        # projections sit between 192 and the LGP expert's hidden size.
+        # ``lgp_anchor_proj`` projects the *current* le-wm state z_t into the
+        # LGP expert's input space; it sits next to the denoising token in the
+        # LGP suffix so the expert sees both "where am I now" and "noisy
+        # future to denoise." Phase A keeps both at single-token granularity
+        # (CLS-only); ``lewm_num_tokens`` doesn't widen the LGP anchor here.
+        self.lgp_in_proj: nn.Linear | None = None
+        self.lgp_out_proj: nn.Linear | None = None
+        self.lgp_time_mlp_in: nn.Linear | None = None
+        self.lgp_time_mlp_out: nn.Linear | None = None
+        self.lgp_anchor_proj: nn.Linear | None = None
+        if self.config.lgp_enabled:
+            lgp_hidden = self.vlm_with_expert.lgp_expert_hidden_size
+            # le-wm encoder output dim is 192 (ViT-Tiny). Hard-coded here
+            # because the encoder isn't loaded yet at projection-init time
+            # when ``lewm_encoder_path`` is None — but LGP always
+            # targets le-wm space regardless of whether action-expert
+            # injection is on.
+            lgp_latent_dim = 192
+            self.lgp_in_proj = nn.Linear(lgp_latent_dim, lgp_hidden)
+            self.lgp_out_proj = nn.Linear(lgp_hidden, lgp_latent_dim)
+            self.lgp_time_mlp_in = nn.Linear(lgp_hidden * 2, lgp_hidden)
+            self.lgp_time_mlp_out = nn.Linear(lgp_hidden, lgp_hidden)
+            self.lgp_anchor_proj = nn.Linear(lgp_latent_dim, lgp_hidden)
+
         # le-wm visual side-channel (frozen ViT-Tiny trained on Libero).
-        # When ``lewm_encoder_path`` is set, le-wm tokens are projected into
-        # either the VLM's prefix (Option A: lewm_inject_to="prefix") or the
-        # action expert's suffix (Option B: lewm_inject_to="suffix").
+        # When ``lewm_encoder_path`` is set, le-wm tokens are prepended to
+        # the action expert's suffix (``lewm_inject_to="suffix"``). The
+        # alternative value ``"none"`` loads the encoder but skips
+        # action-expert injection — used by LGP to consume the
+        # encoder's raw 192-dim features without contaminating the action
+        # stream.
         self.lewm_encoder: LeWMVisionEncoder | None = None
         self.lewm_proj: nn.Linear | None = None
         if self.config.lewm_encoder_path is not None:
-            if self.config.lewm_inject_to not in ("prefix", "suffix"):
+            if self.config.lewm_inject_to not in ("suffix", "none"):
                 raise ValueError(
-                    f"lewm_inject_to must be 'prefix' or 'suffix'; got {self.config.lewm_inject_to!r}"
+                    f"lewm_inject_to must be 'suffix' or 'none'; got {self.config.lewm_inject_to!r}"
                 )
             self.lewm_encoder = LeWMVisionEncoder.from_lewm_checkpoint(
                 self.config.lewm_encoder_path,
@@ -601,13 +713,20 @@ class VLAFlowMatching(nn.Module):
                 patch_size=self.config.lewm_patch_size,
                 freeze=self.config.lewm_freeze,
             )
-            # Prefix injection projects to the VLM hidden size; suffix
-            # injection projects to the action expert hidden size.
-            if self.config.lewm_inject_to == "prefix":
-                proj_out = self.vlm_with_expert.config.text_config.hidden_size
-            else:
+            # Only build the action-expert projection when we're actually
+            # injecting tokens into the action expert. ``"none"`` leaves
+            # ``lewm_proj`` as None so ``compute_lewm_tokens`` returns None
+            # and the suffix path skips injection naturally.
+            if self.config.lewm_inject_to == "suffix":
                 proj_out = self.vlm_with_expert.expert_hidden_size
-            self.lewm_proj = nn.Linear(self.lewm_encoder.output_dim, proj_out)
+                self.lewm_proj = nn.Linear(self.lewm_encoder.output_dim, proj_out)
+
+        if self.config.lgp_enabled and self.lewm_encoder is None:
+            raise ValueError(
+                "lgp_enabled=True requires lewm_encoder_path to be set — "
+                "LGP regresses against the le-wm encoded chunk-end frame, "
+                "which is only available when the encoder is loaded."
+            )
 
         self.set_requires_grad()
         self.fake_image_token = self.vlm_with_expert.processor.tokenizer.fake_image_token_id
@@ -657,14 +776,9 @@ class VLAFlowMatching(nn.Module):
         lang_tokens,
         lang_masks,
         state: torch.Tensor = None,
-        lewm_tokens: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Embed images with SigLIP and language tokens with embedding layer to prepare
         for SmolVLM transformer processing.
-
-        ``lewm_tokens`` (when provided in prefix-injection mode) is inserted
-        after the SigLIP image tokens and before the language tokens, with
-        att_mask=0 so it shares the same input block as image+language.
         """
         embs = []
         pad_masks = []
@@ -716,18 +830,6 @@ class VLAFlowMatching(nn.Module):
                 embs.append(image_end_token)
                 pad_masks.append(image_end_mask)
                 att_masks += [0] * (image_end_mask.shape[1])
-
-        # le-wm tokens (Option A: prefix injection). Inserted after the
-        # SigLIP image tokens and before language. Same att_mask=0 as the
-        # other input tokens so they share the input block.
-        if lewm_tokens is not None:
-            lewm_bsize, num_lewm = lewm_tokens.shape[:2]
-            lewm_pad = torch.ones(
-                lewm_bsize, num_lewm, dtype=torch.bool, device=lewm_tokens.device
-            )
-            embs.append(lewm_tokens)
-            pad_masks.append(lewm_pad)
-            att_masks += [0] * num_lewm
 
         lang_emb = self.vlm_with_expert.embed_language_tokens(lang_tokens)
         # Normalize language embeddings
@@ -854,8 +956,92 @@ class VLAFlowMatching(nn.Module):
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
         return embs, pad_masks, att_masks
 
+    def embed_lgp_suffix(
+        self,
+        anchor_z: torch.Tensor,
+        noisy_z: torch.Tensor,
+        timestep: torch.Tensor,
+    ):
+        """Build the LGP expert's 2-token suffix.
+
+        Tokens (in this order):
+          0. ``anchor_z_t`` — frozen le-wm encoding of the *current* frame,
+             projected into LGP expert space. Acts as the same-space anchor
+             the LGP expert conditions on (matches Phase B's WM rollout
+             starting point).
+          1. ``noisy_z_g + time`` — the denoising token; flow-matching
+             velocity is read from this position at the LGP expert's output.
+
+        Both tokens share one attention block (att_mask=[1, 0]) so they're
+        bidirectional within the LGP suffix. The block sits after the action
+        tokens in the global cumulative-mask scheme, so action tokens cannot
+        see LGP. The reverse direction (LGP → action / LGP → suffix-lewm) is
+        blocked by an additional 2D-mask edit in ``forward()`` so that LGP
+        predicts the chunk-end state purely from (prefix, z_t anchor),
+        independent of the action chunk being committed.
+        """
+        if anchor_z.dim() == 2:
+            anchor_z = anchor_z.unsqueeze(1)
+        if noisy_z.dim() == 2:
+            noisy_z = noisy_z.unsqueeze(1)
+
+        # Anchor token: deterministic projection of z_t into LGP hidden.
+        anchor_emb = self.lgp_anchor_proj(
+            anchor_z.to(self.lgp_anchor_proj.weight.dtype)
+        )  # (B, 1, lgp_hidden)
+
+        # Denoising token: fuse noisy z with sin-cos time embedding.
+        z_emb = self.lgp_in_proj(noisy_z.to(self.lgp_in_proj.weight.dtype))
+        bsize = z_emb.shape[0]
+        device = z_emb.device
+        dtype = z_emb.dtype
+
+        time_emb = create_sinusoidal_pos_embedding(
+            timestep,
+            self.vlm_with_expert.lgp_expert_hidden_size,
+            self.config.min_period,
+            self.config.max_period,
+            device=device,
+        ).type(dtype=dtype)
+        time_emb = time_emb[:, None, :].expand_as(z_emb)
+
+        z_time_emb = torch.cat([z_emb, time_emb], dim=2)
+        z_time_emb = self.lgp_time_mlp_in(z_time_emb)
+        z_time_emb = F.silu(z_time_emb)
+        z_time_emb = self.lgp_time_mlp_out(z_time_emb)
+
+        # Concat anchor + denoising token into a 2-token LGP suffix.
+        anchor_emb = anchor_emb.to(dtype=z_time_emb.dtype)
+        embs = torch.cat([anchor_emb, z_time_emb], dim=1)  # (B, 2, lgp_hidden)
+
+        pad_mask = torch.ones(bsize, 2, dtype=torch.bool, device=device)
+        # att_mask=[1, 0]: anchor opens a new attention block, denoising
+        # token shares it (same cumsum → bidirectional within LGP).
+        att_mask = torch.tensor([1.0, 0.0], dtype=z_time_emb.dtype, device=device)
+        att_mask = att_mask[None, :].expand(bsize, 2)
+        return embs, pad_mask, att_mask
+
+    def _encode_lewm_cls(self, images: list[torch.Tensor]) -> torch.Tensor:
+        """Encode camera-concatenated images via the frozen le-wm encoder
+        and return the CLS token (B, 192).
+
+        Used for both the LGP anchor (current frame) and the LGP regression
+        target (chunk-end frame). Same camera-concat / 224×448 prep that
+        the side-channel encoder uses; gradients are blocked because the
+        encoder is frozen and we only train the LGP head.
+        """
+        if len(images) == 1:
+            stacked = images[0]
+        else:
+            stacked = torch.cat(images, dim=-1)
+        with torch.no_grad():
+            tokens = self.lewm_encoder(stacked)  # (B, num_tokens, 192)
+        return tokens[:, 0, :]  # CLS, (B, 192)
+
     def forward(
-        self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None
+        self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None,
+        chunk_end_images: list[torch.Tensor] | None = None,
+        chunk_end_pad_mask: torch.Tensor | None = None,
     ) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
         if noise is None:
@@ -867,33 +1053,99 @@ class VLAFlowMatching(nn.Module):
         time_expanded = time[:, None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
-        lewm_tokens = self.compute_lewm_tokens(images)
-        prefix_lewm = lewm_tokens if self.config.lewm_inject_to == "prefix" else None
-        suffix_lewm = lewm_tokens if self.config.lewm_inject_to == "suffix" else None
+        suffix_lewm = self.compute_lewm_tokens(images)  # None unless lewm_inject_to="suffix"
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks, state=state, lewm_tokens=prefix_lewm
+            images, img_masks, lang_tokens, lang_masks, state=state
         )
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, time, suffix_lewm)
 
-        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
-        att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
+        # LGP twin-pass — when enabled, build a 2-token suffix for
+        # the LGP expert (anchor z_t + noisy z_g+time) and run both experts
+        # through the shared VLM in one forward.
+        lgp_loss: torch.Tensor | None = None
+        if self.config.lgp_enabled:
+            if chunk_end_images is None:
+                raise ValueError(
+                    "lgp_enabled=True requires chunk_end_images in forward(); "
+                    "the policy wrapper must extract the o_{t+chunk_size} frame from "
+                    "the batch when observation_delta_indices=[0, chunk_size]."
+                )
+            # LGPlives entirely in le-wm space: anchor on z_t (current frame
+            # encoded by le-wm) and regress toward z_{t+chunk_size}.
+            z_t_anchor = self._encode_lewm_cls(images)              # (B, 192)
+            z_g_target = self._encode_lewm_cls(chunk_end_images)    # (B, 192)
 
-        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
-        position_ids = torch.cumsum(pad_masks, dim=1) - 1
-        (_, suffix_out), _ = self.vlm_with_expert.forward(
-            attention_mask=att_2d_masks,
-            position_ids=position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_embs, suffix_embs],
-            use_cache=False,
-            fill_kv_cache=False,
-        )
-        suffix_out = suffix_out[:, -self.config.chunk_size :]
-        # Original openpi code, upcast attention output
-        suffix_out = suffix_out.to(dtype=torch.float32)
-        v_t = self.action_out_proj(suffix_out)
-        losses = F.mse_loss(u_t, v_t, reduction="none")
-        return losses
+            lgp_noise = self.sample_noise(z_g_target.shape, z_g_target.device)
+            lgp_time = self.sample_time(z_g_target.shape[0], z_g_target.device)
+            lgp_t_exp = lgp_time[:, None]
+            lgp_x_t = lgp_t_exp * lgp_noise + (1 - lgp_t_exp) * z_g_target
+            lgp_u_t = lgp_noise - z_g_target
+
+            lgp_embs, lgp_pad_masks, lgp_att_masks = self.embed_lgp_suffix(
+                z_t_anchor, lgp_x_t, lgp_time
+            )
+
+            pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks, lgp_pad_masks], dim=1)
+            att_masks = torch.cat([prefix_att_masks, suffix_att_masks, lgp_att_masks], dim=1)
+            att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+            # Block LGP → suffix attention. The cumulative-mask scheme would
+            # otherwise let LGPtokens read from action (and suffix-lewm)
+            # tokens since their cumsum sits above the suffix. We want LGP
+            # to predict z_g from (prefix, language goal, z_t anchor) only —
+            # independent of the action chunk being committed. Action → LGP
+            # is already blocked by the cumsum ordering (LGP comes later).
+            prefix_len = prefix_pad_masks.shape[1]
+            suffix_len = suffix_pad_masks.shape[1]
+            lgp_start = prefix_len + suffix_len
+            att_2d_masks[:, lgp_start:, prefix_len:lgp_start] = False
+            position_ids = torch.cumsum(pad_masks, dim=1) - 1
+
+            (_, suffix_out, lgp_out), _ = self.vlm_with_expert.forward(
+                attention_mask=att_2d_masks,
+                position_ids=position_ids,
+                past_key_values=None,
+                inputs_embeds=[prefix_embs, suffix_embs, lgp_embs],
+                use_cache=False,
+                fill_kv_cache=False,
+            )
+            # Action loss as before (last chunk_size tokens of action suffix).
+            action_suffix_out = suffix_out[:, -self.config.chunk_size :].to(dtype=torch.float32)
+            v_t = self.action_out_proj(action_suffix_out)
+            losses = F.mse_loss(u_t, v_t, reduction="none")
+
+            # LGP loss: read velocity from the *denoising* token (last
+            # position of the 2-token LGP suffix). The anchor token at
+            # position 0 has no flow-matching role; we discard its output.
+            lgp_v = self.lgp_out_proj(lgp_out[:, -1, :].to(dtype=torch.float32))  # (B, 192)
+            per_sample_fs = F.mse_loss(lgp_u_t, lgp_v, reduction="none").mean(dim=-1)  # (B,)
+            if chunk_end_pad_mask is not None:
+                # ``chunk_end_pad_mask=True`` marks samples where the chunk-
+                # end frame fell past the episode boundary and was padded.
+                # Mask those out to avoid training LGPon stale padding.
+                valid = (~chunk_end_pad_mask).to(dtype=per_sample_fs.dtype)
+                denom = valid.sum().clamp_min(1.0)
+                lgp_loss = (per_sample_fs * valid).sum() / denom
+            else:
+                lgp_loss = per_sample_fs.mean()
+        else:
+            pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+            att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
+
+            att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+            position_ids = torch.cumsum(pad_masks, dim=1) - 1
+            (_, suffix_out), _ = self.vlm_with_expert.forward(
+                attention_mask=att_2d_masks,
+                position_ids=position_ids,
+                past_key_values=None,
+                inputs_embeds=[prefix_embs, suffix_embs],
+                use_cache=False,
+                fill_kv_cache=False,
+            )
+            suffix_out = suffix_out[:, -self.config.chunk_size :]
+            suffix_out = suffix_out.to(dtype=torch.float32)
+            v_t = self.action_out_proj(suffix_out)
+            losses = F.mse_loss(u_t, v_t, reduction="none")
+        return losses, lgp_loss
 
     def sample_actions(
         self,
@@ -914,11 +1166,11 @@ class VLAFlowMatching(nn.Module):
             noise = self.sample_noise(actions_shape, device)
 
         # le-wm tokens are static across denoising steps; compute once.
-        lewm_tokens = self.compute_lewm_tokens(images)
-        prefix_lewm = lewm_tokens if self.config.lewm_inject_to == "prefix" else None
-        suffix_lewm_tokens = lewm_tokens if self.config.lewm_inject_to == "suffix" else None
+        # ``compute_lewm_tokens`` returns None when ``lewm_inject_to="none"``
+        # (encoder loaded but no action-expert injection).
+        suffix_lewm_tokens = self.compute_lewm_tokens(images)
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks, state=state, lewm_tokens=prefix_lewm
+            images, img_masks, lang_tokens, lang_masks, state=state
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1

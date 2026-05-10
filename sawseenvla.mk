@@ -29,7 +29,7 @@ GPU            ?=
 # SmolVLM2 backbone weights (the recipe in docs/source/libero.mdx, applied to
 # the sawseenvla policy registration).
 DATASET_REPO   ?= HuggingFaceVLA/libero
-OUTPUT_DIR     ?= outputs/train/sawseenvla_libero_8k_bs96_2xGPUs_bf16
+OUTPUT_DIR     ?= outputs/train/sawseenvla_lora_r_16_libero_8k_bs96_2xGPUs_bf16
 JOB_NAME       ?= sawseenvla_libero
 STEPS          ?= 8000
 BATCH_SIZE     ?= 96
@@ -50,6 +50,12 @@ PAD_LANGUAGE_TO ?= max_length
 DEVICE         ?= cuda
 WANDB          ?= false
 TENSORBOARD    ?= true
+# PEFT (LoRA) — when true, LoRA adapters land on the frozen VLM's
+# attention Q/V projections (~0.5M trainable params at r=16); the action
+# expert and small projections train fully via modules_to_save.
+# See _get_default_peft_targets in modeling_sawseenvla.py.
+PEFT             ?= true
+LORA_R           ?= 16
 # NUM_GPUS=1 runs lerobot-train directly. NUM_GPUS>1 launches via
 # `accelerate launch --multi_gpu`. BATCH_SIZE is the global batch — accelerate
 # splits it across processes (each GPU sees BATCH_SIZE / NUM_GPUS samples).
@@ -130,7 +136,8 @@ train:
 	  --log_freq=$(LOG_FREQ) \
 	  --eval_freq=$(STEPS) \
 	  --wandb.enable=$(WANDB) \
-	  --tensorboard.enable=$(TENSORBOARD)
+	  --tensorboard.enable=$(TENSORBOARD) \
+	  $(if $(filter true,$(PEFT)),--peft.method_type=LORA --peft.r=$(LORA_R),)
 
 # Force compile_model=false at eval — the saved policy config has
 # compile_model=true from training, and from_pretrained would otherwise trigger

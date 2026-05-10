@@ -127,11 +127,39 @@ class SawSeenVLAWMConfig(PreTrainedConfig):
     lewm_patch_size: int = 14
     # Where the lewm tokens enter the model:
     #   "suffix" → projected to expert_hidden_size, prepended to the action
-    #     expert's suffix (Option B; default, what prior ablations used).
-    #   "prefix" → projected to the VLM's text_config.hidden_size, inserted
-    #     after the SigLIP image tokens in the prefix so SmolVLM mixes them
-    #     with its own vision/language stream (Option A).
+    #     expert's suffix.
+    #   "none"   → encoder is loaded but no tokens flow into the action
+    #     expert. The encoder is still available for other consumers (e.g.
+    #     Future Sight target encoding); used to isolate Future Sight as the
+    #     only le-wm pathway into the training signal.
     lewm_inject_to: str = "suffix"
+
+    # Latent Goal Predictor (LGP) — implementation of the "Future Sight"
+    # expert from design/future-sight-implicit-wm.md (Phase A — single-latent
+    # implicit world modeling). When enabled, a second flow-matching expert
+    # sits next to the action expert on the shared VLM backbone
+    # (layer-interleaved per the twin-experts wrapper). It regresses to the
+    # encoded latent of the frame at offset ``chunk_size`` from the anchor
+    # observation — i.e. the observation that would follow the last action
+    # of the chunk the action expert just emitted. Off by default;
+    # structurally a no-op when False.
+    lgp_enabled: bool = False
+    # Loss weight λ in ``L = L_action + λ · L_lgp``.
+    lgp_loss_weight: float = 1.0
+    # Training signal for the LGP. ``"bc"`` = flow-matching MSE against the
+    # encoded chunk-end frame. ``"contrastive"`` is reserved for a later
+    # ablation (InfoNCE on goal-text vs. chunk-end-latent pairs).
+    lgp_loss_type: str = "bc"
+    # Flow-matching denoising steps for the LGP at inference (unused in
+    # Phase A — there is no LGP inference path yet).
+    lgp_num_steps: int = 10
+    # LGP expert width relative to VLM hidden_size (mirrors
+    # ``expert_width_multiplier`` for the action expert). 0.75 keeps it the
+    # same width as the action expert so they're symmetric heads.
+    lgp_expert_width_multiplier: float = 0.75
+    # Number of LGP expert layers. -1 = match VLM depth (same default as
+    # the action expert via ``num_expert_layers``).
+    lgp_num_expert_layers: int = -1
 
     def __post_init__(self):
         super().__post_init__()
@@ -175,6 +203,12 @@ class SawSeenVLAWMConfig(PreTrainedConfig):
 
     @property
     def observation_delta_indices(self) -> list:
+        # When the LGP is enabled, also fetch the frame at ``chunk_size``
+        # offset from the anchor — that's the LGP regression target. The
+        # dataset returns it alongside the anchor frame, padded if it falls
+        # past the episode end (the LGP loss masks padded samples).
+        if self.lgp_enabled:
+            return [0, self.chunk_size]
         return [0]
 
     @property

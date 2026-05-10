@@ -30,21 +30,23 @@ GPU            ?=
 
 # Train
 DATASET_REPO   ?= HuggingFaceVLA/libero
-OUTPUT_DIR     ?= outputs/train/sawseenvlawm_libero_8k_bs96_lewm1_2xGPUs_bf16
-JOB_NAME       ?= sawseenvlawm_libero
-STEPS          ?= 8000
-# bs=96 per GPU validated on 24 GB cards (21 GB used at lewm_num_tokens=1,
-# concat-cameras 224x448 → suffix length 50 + 1 = 51, essentially vanilla).
-# Larger lewm_num_tokens shrinks the max bs: at lewm_num_tokens=192 (suffix
-# length 50 + 192 = 242, ~5× vanilla), bs=24 is the largest that fits.
-BATCH_SIZE     ?= 96
+# OUTPUT_DIR     ?= outputs/train/sawseenvlawm_libero_10k_bs64_lewm1_lgp_2xGPUs_bf16
+OUTPUT_DIR     ?= outputs/train/sawseenvlawm_test
+JOB_NAME       ?= sawseenvlawm_libero_lgp
+STEPS          ?= 10000
+# bs=64 per GPU on 24 GB cards with LGP=true: the LGP expert adds ~98M
+# trainable params + ~2 extra tokens through the full VLM/expert stack on
+# top of the side-channel suffix. Drop bs further (32) if you also push
+# LEWM_NUM_TOKENS up. Without LGP the side-channel-only configuration
+# fits at bs=96 (21 GB at lewm_num_tokens=1, suffix length 50 + 1 = 51).
+BATCH_SIZE     ?= 64
 NUM_WORKERS    ?= 4
 SAVE_FREQ      ?= 1000
 LOG_FREQ       ?= 100
 # Sqrt-scaled from the bs64 baseline (LR=4e-4 at global_batch=128):
-# LR ≈ 4e-4 × sqrt(global_batch/128). Default tuned for BATCH_SIZE=96 NUM_GPUS=2
-# (global_batch=192 → LR≈5e-4). Re-scale if you change BATCH_SIZE or NUM_GPUS.
-LR             ?= 5.0e-4
+# LR ≈ 4e-4 × sqrt(global_batch/128). Default tuned for BATCH_SIZE=64
+# NUM_GPUS=2 (global_batch=128 → LR=4.0e-4). Re-scale if you change either.
+LR             ?= 4.0e-4
 # Default OFF for the WM variant: torch.compile masks shape mismatches and
 # adds a long warmup that's unhelpful while iterating on the lewm wiring.
 # Flip to true for production / throughput-sensitive runs once stable.
@@ -69,8 +71,22 @@ LEWM_IMAGE_H     ?= 224
 LEWM_IMAGE_W     ?= 448
 # Where lewm tokens enter the model:
 #   suffix → projected to expert_hidden_size, prepended to action expert
-#   prefix → projected to text_config.hidden_size, inserted into SmolVLM prefix
+#   none   → encoder loaded but not injected into the action expert; used for
+#            LGP-only ablations where the Latent Goal Predictor is the
+#            sole le-wm pathway
 LEWM_INJECT_TO   ?= suffix
+
+# Latent Goal Predictor (LGP) — implementation of the "Future Sight" expert
+# from design/future-sight-implicit-wm.md (Phase A). Adds a second
+# flow-matching head next to the action expert that regresses to the
+# encoded chunk-end frame z_{t+chunk_size} in le-wm's 192-dim latent. The
+# active default for sawseenvlawm runs the *combined* configuration —
+# le-wm side-channel into the action expert (LEWM_INJECT_TO=suffix) AND
+# LGP enabled — to test whether the two pathways stack. Set LGP=false for
+# a side-channel-only run, or LEWM_INJECT_TO=none LGP=true for an LGP-only
+# ablation (which isolates the FS effect; see design/SawSeenVLAWM.md).
+LGP              ?= true
+LGP_LOSS_WEIGHT  ?= 1.0
 
 TRAIN_LAUNCHER  = $(if $(filter-out 1,$(NUM_GPUS)),accelerate launch --multi_gpu --num_processes=$(NUM_GPUS) --mixed_precision=$(MIXED_PRECISION) -m lerobot.scripts.lerobot_train,lerobot-train)
 DOCKER_CUDA_ENV = $(if $(filter-out 1,$(NUM_GPUS)),-e CUDA_VISIBLE_DEVICES=$(shell python3 -c "print(','.join(str(i) for i in range($(NUM_GPUS))))"),)
@@ -122,6 +138,8 @@ train:
 	  --policy.lewm_image_height=$(LEWM_IMAGE_H) \
 	  --policy.lewm_image_width=$(LEWM_IMAGE_W) \
 	  --policy.lewm_inject_to=$(LEWM_INJECT_TO) \
+	  --policy.lgp_enabled=$(LGP) \
+	  --policy.lgp_loss_weight=$(LGP_LOSS_WEIGHT) \
 	  --dataset.repo_id=$(DATASET_REPO) \
 	  --output_dir=$(OUTPUT_DIR) \
 	  --job_name=$(JOB_NAME) \

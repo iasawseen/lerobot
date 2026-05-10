@@ -1,4 +1,23 @@
-# SawSeenVLAWM — SawSeenVLA augmented with a le-wm visual side-channel
+# SawSeenVLAWM — SawSeenVLA + le-wm pathways
+
+The `sawseenvlawm` policy hosts two ways to feed le-wm features into the
+training signal, controlled by independent flags:
+
+1. **le-wm visual side-channel** — prepends encoder tokens to the action
+   expert's suffix. Implemented and ablated; **parked** after the 1k-step
+   runs all clustered with the no-lewm baseline (see "Empirical results
+   (parked)" below). Code stays in place.
+2. **Latent Goal Predictor (Phase A — active)** — a second flow-matching
+   expert sitting layer-by-layer next to the action expert on the shared
+   VLM backbone, trained to predict `z_{t+chunk_size}` in le-wm space
+   given `(prefix, language goal, z_t anchor)`. Action-blind by
+   construction. See the [Latent Goal Predictor](#latent-goal-predictor-phase-a--active)
+   section for the full architecture, and
+   [`design/future-sight-implicit-wm.md`](./future-sight-implicit-wm.md)
+   for the broader single-latent implicit-WM synthesis.
+
+The two pathways are independent — you can enable either, both, or
+neither via separate config flags.
 
 ## Why
 
@@ -67,18 +86,12 @@ The le-wm encoder is **frozen ViT-Tiny** trained by JEPA on Libero. It produces
 `num_tokens` (192 by default), project them to the action expert's hidden
 size (720 = 960 × 0.75), and prepend them to the suffix sequence.
 
-### Why the suffix (Option B) and not the prefix (Option A)
-
-| Concern | Prefix injection | Suffix injection (chosen) |
-|---|---|---|
-| Direct path to action expert | No — features pass through 16 frozen SmolVLM layers | Yes — action expert reads them directly |
-| KV cache efficiency | Cacheable across denoising steps | Re-runs per step, but encoder runs once |
-| Risk of being filtered out | High (frozen VLM may not preserve novel features) | Low (trainable cross-attn from action tokens) |
-| Code-change footprint | Modify `embed_prefix`, change prefix length | Modify `embed_suffix`, change suffix length |
-| Compatibility with KV-cache LRU | Have to invalidate/re-warm | Untouched |
-
-The suffix is the right fit because the question is "what extra signal does
-*the action expert* get?", not "what extra signal does the VLM get?".
+The lewm tokens are prepended to the action expert's **suffix** (not the
+VLM's prefix): the question we're answering is "what extra signal does
+*the action expert* get?", not "what extra signal does the VLM get?". A
+prefix-injection variant was implemented and ablated alongside suffix
+injection; both clustered with the no-lewm baseline (see Empirical
+results below) and only the suffix path was retained in the codebase.
 
 ### Attention mask design (within suffix)
 
@@ -175,29 +188,36 @@ If that's too slow, the cheap knobs are:
 
 ## Empirical results (parked, 2026-05-09)
 
-Six 1k-step ablations on libero @ bs=24, LR=2.5e-4, with all six configurations of the lewm side-channel. **None beat the no-lewm baseline.**
+1k-step ablations on libero @ bs=24, LR=2.5e-4, sweeping lewm side-channel
+configurations (token count, freeze, per-cam vs concat-cameras input, and
+prefix-vs-suffix injection — the prefix injection variant has since been
+removed from the codebase, see note below). **None beat the no-lewm
+baseline.**
 
-| variant                          | step rate | GPU mem | step 950 loss |
-|----------------------------------|----------:|--------:|--------------:|
-| lewm=0 (no encoder)              |   1.62 step/s | 8.5 GB | 0.655 |
-| lewm=1 frozen, suffix, per-cam   |   1.55 step/s | 8.5 GB | **0.640** |
-| lewm=1 frozen, suffix, concat    |   1.61 step/s | 6.9 GB | 0.642 |
-| lewm=1 unfrozen, suffix, per-cam |   1.42 step/s | 8.2 GB | 0.639 |
-| lewm=1 frozen, **prefix**, concat |  1.63 step/s | 6.9 GB | 0.639 |
-| lewm=192 frozen, suffix, per-cam |   1.10 step/s | 19.3 GB | 0.656 |
+| variant                           | step rate     | GPU mem | step 950 loss |
+|-----------------------------------|--------------:|--------:|--------------:|
+| lewm=0 (no encoder)               | 1.62 step/s   |  8.5 GB | 0.655         |
+| lewm=1 frozen, suffix, per-cam    | 1.55 step/s   |  8.5 GB | **0.640**     |
+| lewm=1 frozen, suffix, concat     | 1.61 step/s   |  6.9 GB | 0.642         |
+| lewm=1 unfrozen, suffix, per-cam  | 1.42 step/s   |  8.2 GB | 0.639         |
+| lewm=192 frozen, suffix, per-cam  | 1.10 step/s   | 19.3 GB | 0.656         |
+
+(A `lewm=1 frozen, prefix, concat` variant was also run and landed at
+loss 0.639 — equivalent to the suffix variants. The prefix-injection
+codepath was dropped after the ablation since it added complexity without
+distinguishing itself from suffix injection.)
 
 Key observations:
-* All five lewm variants and the no-lewm baseline cluster within 0.017 of each other at step 950 — well within seed-to-seed noise.
+* All lewm variants and the no-lewm baseline cluster within 0.017 of each other at step 950 — well within seed-to-seed noise.
 * lewm=192 (patch tokens) is the only consistent loser earlier in training (steps 300–500 it sits at ~1.3 vs ~1.0 for the others). The action expert spends capacity learning to filter the OOD patch features, then catches up by step 950.
 * Concat-camera vs per-camera input *did not* matter despite matching le-wm's training distribution exactly — runs are within 0.005 of each other throughout.
 * Unfreezing did *not* help — the encoder doesn't learn anything useful in 1k steps.
-* Prefix injection vs suffix injection did *not* matter.
 
 ### Hypothesis for the negative result (most likely first)
 
 1. **The action expert already has rich vision via SmolVLM/SigLIP** (960-d × 16 layers). A frozen 192-d ViT-Tiny can't add information SmolVLM doesn't already extract.
 2. **JEPA next-frame objective ≠ action selection.** Features predictive of "what comes next given an action" aren't necessarily features predictive of "what action to take given a state."
-3. **The trainable `lewm_proj` (192→720 or 192→960) likely learns to suppress an unhelpful stream**, leaving the action expert to rely on the prefix attention.
+3. **The trainable `lewm_proj` (192→720) likely learns to suppress an unhelpful stream**, leaving the action expert to rely on the prefix attention.
 
 ### Status
 
@@ -207,3 +227,233 @@ Key observations:
   * le-wm gets retrained on RoboCasa365 (domain match)
   * an adapter-style injection (Option C) is implemented
   * a longer training horizon is run (>5k steps) to test if the encoder helps only late in training
+
+---
+
+## Latent Goal Predictor (Phase A — active)
+
+A second flow-matching expert that sits **next to the action expert on the
+shared SmolVLM backbone**, trained to predict the chunk-end frame's le-wm
+latent `z_{t+chunk_size}` from `(prefix, language goal, z_t anchor)` —
+explicitly *blind* to the action chunk being committed.
+
+The broader motivation is in
+[`design/future-sight-implicit-wm.md`](./future-sight-implicit-wm.md). This
+section documents the SawSeenVLAWM-specific implementation.
+
+### Why this is the right shape
+
+- The side-channel ablations showed that *adding one more visual stream
+  to the action expert* doesn't move action loss — the SmolVLM/SigLIP
+  prefix already supplies rich vision.
+- The LGP is a different bet: instead of feeding le-wm features to the
+  action expert, train a *second head* on the same backbone to predict
+  the **goal state** in le-wm space. The shared cost is one extra
+  ViT-Tiny encoder pass per step (cheap); the marginal gain is a
+  goal-target generator that maps language to le-wm geometry.
+- This unlocks Phase B (MPC inner loop): given `z_g` from LGP and `z_t`
+  from the encoder, score K perturbations of the action chunk by
+  `d(WM(z_t, a*_k), z_g)` — both endpoints anchored in the same space.
+
+### Architecture
+
+```
+                            VLM (shared, frozen)
+                                  ▲ ▲
+                                  │ │  cross-attn into VLM at every layer
+                       ┌──────────┘ └──────────┐
+                       │                       │
+              ┌────────┴────────┐    ┌─────────┴───────────┐
+              │  Action Expert  │    │  Latent Goal        │
+              │  (existing,     │    │  Predictor (LGP)    │
+              │   own weights)  │    │  (new, 720-d, 16L)  │
+              └────────┬────────┘    └─────────┬───────────┘
+                       │                       │
+                  50 noisy actions      [ z_t_anchor , noisy_z_g + time ]
+                                        (2-token LGP suffix)
+                       │                       │
+                action_out_proj          lgp_out_proj
+                       │                       │
+                v_action (B, 50, 32)     v_lgp (B, 192)
+                       │                       │
+                  L_action (MSE)         L_lgp (MSE)
+                       └──────────┬────────────┘
+                                  │
+                       L = L_action + λ · L_lgp
+
+  Action ↔ LGP attention: blocked in both directions.
+    - Action → LGP:  cumulative-mask ordering (LGP sits after actions)
+    - LGP → Action:  custom 2D-mask edit (att_2d_masks[lgp:, suffix:] = False)
+```
+
+Each expert has its **own weights, projections, depth, and width**. They
+share *only* the VLM backbone (one VLM forward per step) — exactly the
+"share only VLM" coupling style. Per-layer interleaving is identical to
+the existing single-expert path: half the layers do self-attn (Q/K/V
+concatenated and split per stream), the other half do cross-attn (each
+expert reads VLM K/V via its own re-projection).
+
+### LGP suffix structure
+
+```
+LGP suffix = [ z_t_anchor , noisy_z_g + time ]    # 2 tokens, both 720-dim
+
+z_t_anchor  : lgp_anchor_proj( lewm_encoder(o_t)[:, 0, :] )
+              # CLS token of the current frame, projected into LGP hidden.
+              # Frozen, deterministic — the LGP expert's "where am I now."
+
+noisy_z_g+t : lgp_time_mlp_out( silu( lgp_time_mlp_in( [lgp_in_proj(noisy_z), sin_cos_time] ) ) )
+              # Standard flow-matching denoising token.
+              # Velocity is read from this position only (anchor's output
+              # is discarded — it has no flow-matching role).
+```
+
+Within the LGP suffix the two tokens share one attention block
+(`att_mask=[1, 0]`) so they're bidirectional — the denoising token reads
+the anchor at every layer, and vice versa.
+
+### Action-blindness — the 2D-mask edit
+
+The cumulative `att_mask` scheme would let LGP read action tokens (LGP sits
+after actions in the suffix → higher cumsum → LGP sees actions). To enforce
+"LGP predicts the goal state independent of the action chunk", we zero out
+the LGP-rows × suffix-columns quadrant of the 2D attention mask after
+building it the standard way:
+
+```python
+att_2d_masks = make_att_2d_masks(pad_masks, att_masks)      # cumulative
+lgp_start = prefix_len + suffix_len                          # LGP tokens start here
+att_2d_masks[:, lgp_start:, prefix_len:lgp_start] = False    # block LGP → suffix
+```
+
+So LGP attends to: prefix (image, language, state) plus its own anchor +
+denoise tokens. Nothing in the action expert's suffix.
+
+The reverse direction (action → LGP) is already blocked by cumulative
+ordering — actions have lower cumsum than LGP tokens.
+
+This makes the action expert and the LGP expert **conditionally
+independent given the prefix**. Both branches use the same multimodal
+context but never see each other.
+
+### Why "predict goal independently of actions"
+
+If LGP were action-conditioned, its `z_g` would partly reflect the policy's
+own choices — the MPC scorer would then rank candidates against itself,
+conflating "what the policy will do" with "what it should do." Making LGP
+read only `(language goal, scene, robot state, z_t)` keeps `z_g` fixed
+across the K action perturbations at inference and gives the scorer a
+clean, action-independent target.
+
+### Twin-experts wrapper
+
+`src/lerobot/policies/sawseenvlawm/smolvlm_with_two_experts.py` —
+`SmolVLMWithTwoExpertsModel(SmolVLMWithExpertModel)`. Adds a second
+`lm_expert` (the LGP expert) with its own width / depth, and generalizes
+the cross-attn dispatch from one expert to N via
+`_forward_cross_attn_layer_n`. Falls back to the parent's single-expert
+path when called with `inputs_embeds` of length ≤ 2 (e.g., inference Mode
+1, where only the action expert fires).
+
+Per-expert weight counts at the SawSeenVLA defaults
+(`expert_width_multiplier=0.75`, `num_vlm_layers=16`):
+
+| Expert  | Hidden | Layers | Trainable params |
+|---------|-------:|-------:|-----------------:|
+| Action  |    720 |     16 |             ~98M |
+| LGP      |    720 |     16 |             ~98M |
+
+Doubling the trainable parameter count vs vanilla sawseenvlawm
+(when LGP is on) is a known cost.
+
+### Config surface
+
+Five new fields on `SawSeenVLAWMConfig`, plus one new value for the
+existing `lewm_inject_to`:
+
+| Field | Default | Notes |
+|---|---|---|
+| `lgp_enabled` | `False` | Master switch. Off → bit-identical to vanilla sawseenvlawm. |
+| `lgp_loss_weight` | `1.0` | λ in `L = L_action + λ · L_fs`. |
+| `lgp_loss_type` | `"bc"` | Phase A only: flow-matching MSE. `"contrastive"` reserved for a later ablation. |
+| `lgp_num_steps` | `10` | Inference-time denoising steps for LGP (unused in Phase A). |
+| `lgp_expert_width_multiplier` | `0.75` | Mirrors the action expert default; keeps the two heads symmetric. |
+| `lgp_num_expert_layers` | `-1` | -1 = match VLM depth (same default as the action expert). |
+| `lewm_inject_to=`**`"none"`** | — | New value. Encoder is loaded but no tokens flow into the action expert. Used to isolate the LGP as the only le-wm pathway into the training signal. |
+
+`observation_delta_indices` is now a property: returns `[0, chunk_size]`
+when LGP is enabled (so the dataset delivers both the anchor and chunk-end
+frames per sample), `[0]` otherwise.
+
+### Code touchpoints
+
+| Path | Status | Purpose |
+|---|---|---|
+| `src/lerobot/policies/sawseenvlawm/smolvlm_with_two_experts.py` | new | `SmolVLMWithTwoExpertsModel`. Adds `lgp_expert` + multi-stream cross-attn dispatch. |
+| `src/lerobot/policies/sawseenvlawm/configuration_sawseenvlawm.py` | edit | Six new fields; `observation_delta_indices` returns `[0, chunk_size]` when LGP is on; `lewm_inject_to="none"` allowed. |
+| `src/lerobot/policies/sawseenvlawm/modeling_sawseenvlawm.py` | edit | Picks `SmolVLMWithTwoExpertsModel` over `SmolVLMWithExpertModel` when LGP is on. New projections (`lgp_in_proj`, `lgp_anchor_proj`, `lgp_time_mlp_*`, `lgp_out_proj`). New methods `embed_lgp_suffix`, `_encode_lewm_cls`, `prepare_chunk_end_images`. LGP branch in `VLAFlowMatching.forward()` returns `(action_losses, lgp_loss)`. Outer policy `forward()` combines them and surfaces `loss_action` / `loss_lgp` in `loss_dict`. |
+| `sawseenvlawm.mk` | edit | New `LGP`, `LGP_LOSS_WEIGHT` knobs; passes `--policy.lgp_enabled` and `--policy.lgp_loss_weight` to `lerobot-train`. |
+
+### Loss and logging
+
+The combined loss `L = L_action + λ · L_fs` is what the optimizer sees.
+Three TB scalars surface every log step:
+
+| TB scalar | What it is |
+|---|---|
+| `train/loss_action` | Action expert flow-matching MSE alone |
+| `train/loss_lgp` | LGP flow-matching MSE alone |
+| `train/loss` | Combined optimizer loss |
+
+This works automatically because `loss_dict` is merged into the
+`output_dict` returned from `policy.forward()`, and the training loop
+already feeds `output_dict` into the TB logger.
+
+### What LGP is *not* doing yet (Phase A boundary)
+
+- **No inference path.** `sample_actions` calls the wrapper with
+  `inputs_embeds=[prefix, action_suffix]` (length 2), which falls back to
+  the parent's single-expert path. LGP is silent at inference.
+- **No MPC inner loop.** K-perturbation + WM rollout + argmin is Phase B.
+- **No le-wm JEPA predictor.** Only the encoder is loaded — the
+  forward-dynamics predictor lands in Phase B.
+- **No contrastive loss.** `lgp_loss_type="bc"` is the only
+  path; flow-matching MSE against the encoded chunk-end.
+- **No distillation.** Mode-3 in the synthesis doc is Phase D.
+
+### Validation gate
+
+| Run | Status | Result |
+|---|---|---|
+| 4-step smoke (bs=2, 1-token LGP suffix) | done | `loss_lgp` 2.41 → 1.96 → 1.88; gradients flow into both experts |
+| 4-step smoke (bs=2, 2-token LGP suffix + action-blind mask) | pending — GPU contention | architecture verified by import test; smoke pending GPU availability |
+| Long LGP-only ablation (`LGP=true LEWM_INJECT_TO=none`) | pending | clean isolation of LGP's effect on action loss |
+| LGP retrieval probe at chunk-end checkpoint | pending | held-out cosine sim of LGP-decoded `z_g` vs actual encoded chunk-end frame should beat random other-episode chunk-end frames |
+
+### Recommended ablation matrix
+
+| Run | LEWM_INJECT_TO | LGP | What it isolates |
+|---|---|---|---|
+| Baseline (vanilla sawseenvla) | n/a | false | Vanilla reference |
+| Side-channel only (existing parked result) | suffix (k=1) | false | The parked ablation |
+| **LGP-only (target)** | **none** | **true** | **Pure LGP effect on action loss** |
+| LGP + side-channel | suffix (k=1) | true | Stacked uplift (if any) |
+
+The clean experiment is "LGP-only" vs "Baseline" — both have the same
+information available to the action expert (prefix only, no le-wm
+side-channel), the only difference being whether LGP is trained as a
+joint auxiliary head.
+
+### Run command
+
+```bash
+# LGP-only Phase A ablation:
+make -f sawseenvlawm.mk train \
+  LGP=true LEWM_INJECT_TO=none \
+  STEPS=8000 BATCH_SIZE=64 \
+  OUTPUT_DIR=outputs/train/sawseenvlawm_libero_lgp_only_8k
+```
+
+`BATCH_SIZE` may need to drop from 96 → 64 to fit the LGP expert's ~98M
+extra params on 24 GB cards. Watch `nvidia-smi` during the first 200
+steps and bump up if there's headroom.

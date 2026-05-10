@@ -484,25 +484,44 @@ class SawSeenVLAPolicy(PreTrainedPolicy):
         return actions
 
     def _get_default_peft_targets(self) -> dict[str, any]:
-        """Return default PEFT target modules for SawSeenVLA fine-tuning."""
-        common_projections = (
-            "state_proj|action_in_proj|action_out_proj|action_time_mlp_in|action_time_mlp_out"
-        )
-        target_modules = rf"(model\.vlm_with_expert\.lm_expert\..*\.(q|v)_proj|model\.({common_projections}))"
+        """Return default PEFT target modules for SawSeenVLA fine-tuning.
+
+        LoRA adapters land on the **frozen SmolVLM2 VLM**'s attention
+        Q/V projections — that's the value of PEFT here, since the VLM
+        is the only pretrained component. The action expert is randomly
+        initialized via ``AutoModel.from_config`` so LoRA-ing it would
+        freeze random weights; instead we put it (plus the small
+        projections) into ``modules_to_save`` so they train fully.
+        """
+        target_modules = r"model\.vlm_with_expert\.vlm\..*\.self_attn\.(q|v)_proj"
+        modules_to_save = [
+            "lm_expert",
+            "state_proj",
+            "action_in_proj", "action_out_proj",
+            "action_time_mlp_in", "action_time_mlp_out",
+        ]
         return {
             "target_modules": target_modules,
-            "modules_to_save": [],
+            "modules_to_save": modules_to_save,
         }
 
     def _validate_peft_config(self, peft_config) -> None:
-        """Validate PEFT configuration for SawSeenVLA."""
-        super()._validate_peft_config(peft_config)
-        if not self.config.load_vlm_weights:
-            import logging
+        """Validate PEFT configuration for SawSeenVLA.
 
-            logging.warning(
-                "Training SawSeenVLA from scratch using PEFT. This is unlikely to yield good results. "
-                "Set `load_vlm_weights=True` to fine-tune the existing policy."
+        Skips the base-class ``pretrained_path`` requirement: for
+        SawSeenVLA the LoRA targets the **VLM** (which is loaded via
+        ``load_vlm_weights=True`` from the HF Hub, not from a SawSeenVLA
+        checkpoint). Either a SawSeenVLA pretrained_path OR
+        load_vlm_weights=True is enough to make PEFT meaningful.
+        """
+        if not self.config.pretrained_path and not self.config.load_vlm_weights:
+            raise ValueError(
+                "PEFT is enabled but neither pretrained_path nor "
+                "load_vlm_weights is set. LoRA targets the frozen pretrained "
+                "VLM; with random VLM init there is nothing useful to adapt. "
+                "Set load_vlm_weights=True (to fine-tune from the HF VLM "
+                "checkpoint) or supply --policy.path=<sawseenvla_ckpt> (to "
+                "adapt an existing SawSeenVLA checkpoint), or disable PEFT."
             )
 
 
