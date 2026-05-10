@@ -486,14 +486,20 @@ class SawSeenVLAPolicy(PreTrainedPolicy):
     def _get_default_peft_targets(self) -> dict[str, any]:
         """Return default PEFT target modules for SawSeenVLA fine-tuning.
 
-        LoRA adapters land on the **frozen SmolVLM2 VLM**'s attention
+        LoRA adapters land on the **frozen SmolVLM2 text model**'s attention
         Q/V projections — that's the value of PEFT here, since the VLM
         is the only pretrained component. The action expert is randomly
         initialized via ``AutoModel.from_config`` so LoRA-ing it would
         freeze random weights; instead we put it (plus the small
         projections) into ``modules_to_save`` so they train fully.
+
+        Scoped to ``text_model`` so the **vision encoder** stays fully
+        frozen (no LoRA adapters → no retained vision activations during
+        backward). Including the vision tower in target_modules forces
+        autograd to keep activations through ~27 ViT layers and blew
+        24 GB GPUs at bs=64.
         """
-        target_modules = r"model\.vlm_with_expert\.vlm\..*\.self_attn\.(q|v)_proj"
+        target_modules = r"model\.vlm_with_expert\.vlm\.model\.text_model\..*\.self_attn\.(q|v)_proj"
         modules_to_save = [
             "lm_expert",
             "state_proj",

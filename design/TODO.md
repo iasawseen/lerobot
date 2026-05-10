@@ -7,24 +7,87 @@ unless explicitly noted; each can land as its own PR.
 
 ## 1. LoRA for the frozen VLM
 
-**Status:** scoped, not implemented.
+**Status:**
+- **sawseenvla:** shipped (variant **A**, r=16). Verified at bs=64,
+  2× RTX 3090: ~100.7M trainable, 15.5 / 24 GB per GPU, ~1.27 s/step.
+- **sawseenvlawm:** scoped, not yet wired (regex still scoped to
+  experts; needs the same `text_model`-only target as sawseenvla, plus
+  `lgp_*` and `lewm_proj` in `modules_to_save`).
 
-The sawseenvlawm policy freezes the entire SmolVLM2 backbone via
-`train_expert_only=True`. PEFT is wired in at the lerobot level (see
-`src/lerobot/configs/default.py:PeftConfig` and
-`SawSeenVLAWMPolicy._get_default_peft_targets`), but the current target
-regex was inherited from sawseenvla and only adapts the action expert,
-not the VLM.
+The VLM (SmolVLM2-500M, with the SawSeenVLA default truncation to
+**16 text decoder layers**, hidden=960) is otherwise fully frozen.
+PEFT is wired at the lerobot level (`src/lerobot/configs/default.py:PeftConfig`
++ each policy's `_get_default_peft_targets`).
 
-Add LoRA adapters to the VLM's attention `q_proj`/`v_proj` so the VLM
-itself can adapt to libero's distribution while staying parameter-cheap.
+### Placement variants
 
-**Concrete changes:**
+The frozen VLM has three adaptable surfaces:
 
-- Update `_get_default_peft_targets` in `modeling_sawseenvlawm.py`:
+- **Vision encoder** (24 ViT layers, d=768)
+- **Connector** (small vision→text projector, `multi_modal_projector`)
+- **Text decoder** (16 trimmed layers, d=960)
+
+| # | Where LoRA lands | LoRA params (r=16) | Activation memory | Notes |
+|---|---|---|---|---|
+| **A** | text Q, V | ~1 M | baseline | **Shipped for sawseenvla.** Standard LoRA-paper default. |
+| **B** | text Q, K, V, O | ~2 M | same as A | Standard "full attention" recipe; cheap upgrade over A. |
+| **C** | text Q, K, V, O + MLP (gate/up/down) | ~6 M | small bump (text MLP grads already retained) | "QLoRA recipe". Most expressive text adaptation, still fits at bs=64. |
+| **D** | text Q, V + vision Q, V | ~1.6 M | **+~10 GB** (needs bs≈32) | Adapts visual domain (LIBERO ≠ web images). Forces autograd through the vision encoder — was the OOM at bs=64 before scoping the regex. |
+| **E** | vision Q, V only | ~0.6 M | +~10 GB | Isolates "vision shift is the bottleneck" hypothesis. Same memory cost as D for less. |
+| **F** | connector unfreeze (`modules_to_save`) + any text variant | + a few M | baseline | Fully trains the small vision→text bridge. Combinable with A/B/C. |
+
+**Important:** activation memory is controlled by *which surfaces*
+carry trainable params, not by `r`. Adding LoRA to the vision encoder
+(D, E) forces autograd to retain ~24 ViT layers of activations; that's
+the only variant that pushes us off bs=64 on 24 GB cards.
+
+The shipped regex (variant A, sawseenvla) is
 
 ```python
-target_modules = r"model\.vlm_with_expert\.vlm\..*\.self_attn\.(q|v)_proj"
+target_modules = r"model\.vlm_with_expert\.vlm\.model\.text_model\..*\.self_attn\.(q|v)_proj"
+```
+
+Note the `text_model\.` scoping — without it the regex matches the
+ViT's `self_attn.q_proj`/`v_proj` too (24 modules) and pulls vision
+activations into the backward path.
+
+### Rank variants
+
+For variant A on the trimmed VLM (16 text layers, d=960). LoRA params
+scale linearly with `r`; activation memory does **not** depend on `r`.
+
+| r | LoRA params | Adam state (fp32) | Notes |
+|---|---|---|---|
+| **r=4** | ~245 k | ~3 MB | Original LoRA paper default. Underfits unless adaptation is mild. |
+| **r=8** | ~492 k | ~6 MB | HF/PEFT library default. Light. |
+| **r=16** | ~983 k | ~12 MB | **Shipped.** Common fine-tune sweet spot. |
+| **r=32** | ~1.97 M | ~24 MB | Standard middle-ground for serious adaptation. |
+| **r=64** | ~3.93 M | ~47 MB | "QLoRA recipe" rank. Diminishing returns vs full-FT after this. |
+| **r=128** | ~7.86 M | ~94 MB | Rarely useful — approaches full-FT cost without its weight-update freedom. |
+
+Interacting knobs: `lora_alpha` (effective scale = α/r; PEFT default
+α=`r`), `lora_dropout` (0 for small datasets, 0.05–0.1 for noisier
+regimes). Bumping α without retuning LR acts like a higher LR on
+adapters.
+
+### Recommendation for LIBERO (~270k frames)
+
+- **r=16 + variant A** is the current shipped baseline.
+- **B (Q,K,V,O)** is the obvious cheap bump — same memory, 2× LoRA
+  mass, well-trodden recipe.
+- **r=32** is the obvious capacity bump if A/B underfit.
+- Reserve **D/E** for a separate ablation (bs≈32) only if the policy
+  underperforms full-FT and we suspect vision is the bottleneck.
+- **r=64+** is overkill at this dataset size — pure optim-state cost
+  without expected gains.
+
+### sawseenvlawm scaffolding (still pending)
+
+Apply the shipped target regex + extend `modules_to_save` with the
+LGP-specific projections:
+
+```python
+target_modules = r"model\.vlm_with_expert\.vlm\.model\.text_model\..*\.self_attn\.(q|v)_proj"
 modules_to_save = [
     "lm_expert", "lgp_expert",
     "state_proj",
@@ -36,19 +99,9 @@ modules_to_save = [
 ]
 ```
 
-- Add `PEFT ?= false` and `LORA_R ?= 16` knobs to `sawseenvlawm.mk`,
-  conditionally append `--peft.method_type=LORA --peft.r=$(LORA_R)` to
-  the train target.
-
-**Trainable params delta:** ~0.5M (16 layers × 2 projs × 2·960·16 at r=16)
-on top of the existing ~196M expert + projection params.
-
-**Open questions:**
-- Q/V only vs. Q/K/V/O — Q/V is the LoRA paper default; Q/K/V/O ~2× the
-  adapter params and sometimes helps on multimodal tasks.
-- Default `r` — 16 (lerobot's `PeftConfig` default), 32, or task-specific?
-- LoRA on SigLIP vision encoder too? Currently frozen; probably not
-  needed for libero scenes but worth ablating later.
+Plus `PEFT ?= true` and `LORA_R ?= 16` knobs in `sawseenvlawm.mk` (the
+makefile already conditionally appends `--peft.method_type=LORA
+--peft.r=$(LORA_R)` once those vars are added).
 
 **Scope:** ~10 LOC + makefile.
 
@@ -298,9 +351,10 @@ test, plus the comparison run.
 1. **Inverse-sqrt LR scheduler** first — smallest diff, orthogonal to
    architecture changes, gives a horizon-agnostic alternative to cosine
    that's a drop-in for any subsequent run.
-2. **LoRA for VLM** — small change, gives the VLM a cheap adaptation
-   channel and a known-baseline for comparison. Required prerequisite
-   for KI+FAST+LoRA below.
+2. **LoRA for VLM** — shipped for sawseenvla (variant A, r=16). Port
+   the same scaffolding to sawseenvlawm next; it's the prerequisite for
+   KI+FAST+LoRA below. Variant ablations (B/C, r=32) once the baseline
+   has a clean training curve.
 3. **Phase B of VLAWM hybrid** — *after* Phase A LGP shows non-trivial
    retrieval accuracy. No point wiring MPC if the FS head isn't
    producing meaningful goal latents.

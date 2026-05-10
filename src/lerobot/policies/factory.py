@@ -53,6 +53,7 @@ from .pi05.configuration_pi05 import PI05Config
 from .pretrained import PreTrainedPolicy
 from .sac.configuration_sac import SACConfig
 from .sawseenvla.configuration_sawseenvla import SawSeenVLAConfig
+from .sawseenvlaki.configuration_sawseenvlaki import SawSeenVLAKIConfig
 from .sawseenvlawm.configuration_sawseenvlawm import SawSeenVLAWMConfig
 from .smolvla.configuration_smolvla import SmolVLAConfig
 from .tdmpc.configuration_tdmpc import TDMPCConfig
@@ -140,6 +141,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from .sawseenvla.modeling_sawseenvla import SawSeenVLAPolicy
 
         return SawSeenVLAPolicy
+    elif name == "sawseenvlaki":
+        from .sawseenvlaki.modeling_sawseenvlaki import SawSeenVLAKIPolicy
+
+        return SawSeenVLAKIPolicy
     elif name == "sawseenvlawm":
         from .sawseenvlawm.modeling_sawseenvlawm import SawSeenVLAWMPolicy
 
@@ -202,6 +207,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return SmolVLAConfig(**kwargs)
     elif policy_type == "sawseenvla":
         return SawSeenVLAConfig(**kwargs)
+    elif policy_type == "sawseenvlaki":
+        return SawSeenVLAKIConfig(**kwargs)
     elif policy_type == "sawseenvlawm":
         return SawSeenVLAWMConfig(**kwargs)
     elif policy_type == "groot":
@@ -400,6 +407,14 @@ def make_pre_post_processors(
         from .sawseenvla.processor_sawseenvla import make_sawseenvla_pre_post_processors
 
         processors = make_sawseenvla_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
+    elif isinstance(policy_cfg, SawSeenVLAKIConfig):
+        from .sawseenvlaki.processor_sawseenvlaki import make_sawseenvlaki_pre_post_processors
+
+        processors = make_sawseenvlaki_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )

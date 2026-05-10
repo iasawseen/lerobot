@@ -51,7 +51,7 @@ DEVICE         ?= cuda
 WANDB          ?= false
 TENSORBOARD    ?= true
 # PEFT (LoRA) — when true, LoRA adapters land on the frozen VLM's
-# attention Q/V projections (~0.5M trainable params at r=16); the action
+# attention Q/V projections (~2M trainable params at r=16); the action
 # expert and small projections train fully via modules_to_save.
 # See _get_default_peft_targets in modeling_sawseenvla.py.
 PEFT             ?= true

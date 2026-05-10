@@ -295,6 +295,7 @@ class SmolVLMWithExpertModel(nn.Module):
         use_cache: bool = True,
         fill_kv_cache: bool = True,
         past_key_values=None,
+        detach_kv_for_expert: bool = False,
     ) -> list[torch.Tensor]:
         attention_interface = self.get_attention_interface()
 
@@ -363,13 +364,24 @@ class SmolVLMWithExpertModel(nn.Module):
             _key_states = key_states.to(dtype=expert_layer.self_attn.k_proj.weight.dtype).view(
                 *key_states.shape[:2], -1
             )
+            _value_states = value_states.to(dtype=expert_layer.self_attn.v_proj.weight.dtype).view(
+                *value_states.shape[:2], -1
+            )
+            # KI detach barrier — used by sawseenvlaki. Severs the
+            # gradient path from the action expert's attention output
+            # back into the VLM's hidden states / weights, so the
+            # flow-matching MSE on top of the action expert never
+            # updates VLM parameters. The VLM's own forward (which
+            # produced ``key_states``/``value_states``) keeps its
+            # autograd graph intact for any other consumer (e.g. the
+            # FAST CE head reading the same prefix hidden states).
+            if detach_kv_for_expert:
+                _key_states = _key_states.detach()
+                _value_states = _value_states.detach()
             expert_key_states = expert_layer.self_attn.k_proj(_key_states).view(
                 *_key_states.shape[:-1], -1, expert_layer.self_attn.head_dim
             )  # k_proj should have same dim as kv
 
-            _value_states = value_states.to(dtype=expert_layer.self_attn.v_proj.weight.dtype).view(
-                *value_states.shape[:2], -1
-            )
             expert_value_states = expert_layer.self_attn.v_proj(_value_states).view(
                 *_value_states.shape[:-1], -1, expert_layer.self_attn.head_dim
             )
@@ -420,6 +432,7 @@ class SmolVLMWithExpertModel(nn.Module):
         inputs_embeds: list[torch.FloatTensor] = None,
         use_cache: bool | None = None,
         fill_kv_cache: bool | None = None,
+        detach_kv_for_expert: bool = False,
     ):
         models = [self.get_vlm_model().text_model, self.lm_expert]
         model_layers = self.get_model_layers(models)
@@ -464,6 +477,7 @@ class SmolVLMWithExpertModel(nn.Module):
                     use_cache=use_cache,
                     fill_kv_cache=fill_kv_cache,
                     past_key_values=past_key_values,
+                    detach_kv_for_expert=detach_kv_for_expert,
                 )
             outputs_embeds = []
             start = 0
