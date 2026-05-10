@@ -29,15 +29,13 @@ GPU            ?=
 # SmolVLM2 backbone weights (the recipe in docs/source/libero.mdx, applied to
 # the sawseenvla policy registration).
 DATASET_REPO   ?= HuggingFaceVLA/libero
-# OUTPUT_DIR     ?= outputs/train/sawseenvla_libero_96k_bs96_compile_2xGPUs_bf16
-OUTPUT_DIR     ?= outputs/train/sawseenvla_libero_8k_bs96_compile_2xGPUs_bf16
-# OUTPUT_DIR     ?= outputs/train/sawseenvla_libero_test
+OUTPUT_DIR     ?= outputs/train/sawseenvla_libero_8k_bs96_2xGPUs_bf16
 JOB_NAME       ?= sawseenvla_libero
 STEPS          ?= 8000
 BATCH_SIZE     ?= 96
 NUM_WORKERS    ?= 4
 SAVE_FREQ      ?= 1000
-LOG_FREQ       ?= 200
+LOG_FREQ       ?= 100
 # Peak LR (cosine schedule). Square-root scaled with global batch from the
 # bs64 baseline (LR=4e-4 at global_batch=128): LR ≈ 4e-4 × sqrt(global_batch/128).
 # Default is tuned for BATCH_SIZE=96, NUM_GPUS=2 (global_batch=192 → LR≈5e-4).
@@ -46,11 +44,12 @@ LR             ?= 5.0e-4
 # BUT requires pad_language_to=max_length — with "longest", per-batch language
 # token length changes shape → dynamo recompile storm → 5-15× slowdown.
 # Set COMPILE_MODEL=false for fast smoke runs (skips ~10-min compile warmup).
-COMPILE_MODEL   ?= true
+COMPILE_MODEL   ?= false
 COMPILE_MODE    ?= max-autotune
 PAD_LANGUAGE_TO ?= max_length
 DEVICE         ?= cuda
 WANDB          ?= false
+TENSORBOARD    ?= true
 # NUM_GPUS=1 runs lerobot-train directly. NUM_GPUS>1 launches via
 # `accelerate launch --multi_gpu`. BATCH_SIZE is the global batch — accelerate
 # splits it across processes (each GPU sees BATCH_SIZE / NUM_GPUS samples).
@@ -75,7 +74,7 @@ DOCKER_CUDA_ENV = $(if $(filter-out 1,$(NUM_GPUS)),-e CUDA_VISIBLE_DEVICES=$(she
 # the SmolVLM2 backbone instead.
 # EVAL_POLICY    ?= outputs/train/sawseenvla_libero_96k_bs64_2xGPUs_bf16/checkpoints/last/pretrained_model
 # EVAL_POLICY    ?= outputs/train/sawseenvla_libero_96k_bs96_compile_2xGPUs_bf16/checkpoints/last/pretrained_model
-EVAL_POLICY    ?= outputs/train/sawseenvla_libero_8k_bs96_compile_2xGPUs_bf16/checkpoints/last/pretrained_model
+EVAL_POLICY    ?= outputs/train/sawseenvla_libero_8k_bs96_2xGPUs_bf16/checkpoints/last/pretrained_model
 
 EVAL_TASKS     ?= libero_spatial,libero_object,libero_goal,libero_10
 EVAL_EPISODES  ?= 10
@@ -130,7 +129,8 @@ train:
 	  --save_freq=$(SAVE_FREQ) \
 	  --log_freq=$(LOG_FREQ) \
 	  --eval_freq=$(STEPS) \
-	  --wandb.enable=$(WANDB)
+	  --wandb.enable=$(WANDB) \
+	  --tensorboard.enable=$(TENSORBOARD)
 
 # Force compile_model=false at eval — the saved policy config has
 # compile_model=true from training, and from_pretrained would otherwise trigger

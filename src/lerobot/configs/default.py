@@ -65,6 +65,14 @@ class WandBConfig:
 
 
 @dataclass
+class TensorBoardConfig:
+    # Local TensorBoard scalar logging into ``output_dir/<subdir>``. Independent
+    # of WandB — both can be enabled simultaneously.
+    enable: bool = True
+    subdir: str = "tensorboard"
+
+
+@dataclass
 class EvalConfig:
     n_episodes: int = 50
     # `batch_size` specifies the number of environments to use in a gym.vector.VectorEnv.

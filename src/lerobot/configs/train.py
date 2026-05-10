@@ -30,7 +30,7 @@ from lerobot.optim import LRSchedulerConfig, OptimizerConfig
 from lerobot.utils.hub import HubMixin
 from lerobot.utils.sample_weighting import SampleWeightingConfig
 
-from .default import DatasetConfig, EvalConfig, PeftConfig, WandBConfig
+from .default import DatasetConfig, EvalConfig, PeftConfig, TensorBoardConfig, WandBConfig
 from .policies import PreTrainedConfig
 from .rewards import RewardModelConfig
 
@@ -111,6 +111,7 @@ class TrainPipelineConfig(HubMixin):
     scheduler: LRSchedulerConfig | None = None
     eval: EvalConfig = field(default_factory=EvalConfig)
     wandb: WandBConfig = field(default_factory=WandBConfig)
+    tensorboard: TensorBoardConfig = field(default_factory=TensorBoardConfig)
     peft: PeftConfig | None = None
 
     # Sample weighting configuration (e.g., for RA-BC training)

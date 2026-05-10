@@ -30,22 +30,21 @@ GPU            ?=
 
 # Train
 DATASET_REPO   ?= HuggingFaceVLA/libero
-OUTPUT_DIR     ?= outputs/train/sawseenvlawm_libero_16k_bs24_2xGPUs_bf16
+OUTPUT_DIR     ?= outputs/train/sawseenvlawm_libero_8k_bs96_lewm1_2xGPUs_bf16
 JOB_NAME       ?= sawseenvlawm_libero
-STEPS          ?= 16000
-# bs=24 per GPU validated on 24 GB cards (19.3 GB used at lewm_num_tokens=192,
-# 2 cameras → suffix length 50 + 384 = 434, ~8.7× vanilla SawSeenVLA suffix).
-# Vanilla bs=96 OOMs with lewm; bs=32 likely fits; bs=64 won't. Drop further if
-# you raise lewm_num_tokens, increase camera count, or enable activation
-# checkpointing later.
-BATCH_SIZE     ?= 24
+STEPS          ?= 8000
+# bs=96 per GPU validated on 24 GB cards (21 GB used at lewm_num_tokens=1,
+# concat-cameras 224x448 → suffix length 50 + 1 = 51, essentially vanilla).
+# Larger lewm_num_tokens shrinks the max bs: at lewm_num_tokens=192 (suffix
+# length 50 + 192 = 242, ~5× vanilla), bs=24 is the largest that fits.
+BATCH_SIZE     ?= 96
 NUM_WORKERS    ?= 4
 SAVE_FREQ      ?= 1000
-LOG_FREQ       ?= 200
+LOG_FREQ       ?= 100
 # Sqrt-scaled from the bs64 baseline (LR=4e-4 at global_batch=128):
-# LR ≈ 4e-4 × sqrt(global_batch/128). Default tuned for BATCH_SIZE=24 NUM_GPUS=2
-# (global_batch=48 → LR≈2.5e-4). Re-scale if you change BATCH_SIZE or NUM_GPUS.
-LR             ?= 2.5e-4
+# LR ≈ 4e-4 × sqrt(global_batch/128). Default tuned for BATCH_SIZE=96 NUM_GPUS=2
+# (global_batch=192 → LR≈5e-4). Re-scale if you change BATCH_SIZE or NUM_GPUS.
+LR             ?= 5.0e-4
 # Default OFF for the WM variant: torch.compile masks shape mismatches and
 # adds a long warmup that's unhelpful while iterating on the lewm wiring.
 # Flip to true for production / throughput-sensitive runs once stable.
@@ -54,6 +53,7 @@ COMPILE_MODE    ?= max-autotune
 PAD_LANGUAGE_TO ?= max_length
 DEVICE         ?= cuda
 WANDB          ?= false
+TENSORBOARD    ?= true
 NUM_GPUS       ?= 2
 MIXED_PRECISION ?= bf16
 
@@ -63,7 +63,7 @@ MIXED_PRECISION ?= bf16
 # after Resize(224)). LEWM_NUM_TOKENS is sliced from the ViT output:
 #   1   = CLS-only (cheapest)
 #   513 = full grid for 224x448 (16x32 patches + CLS)
-LEWM_NUM_TOKENS  ?= 192
+LEWM_NUM_TOKENS  ?= 1
 LEWM_FREEZE      ?= true
 LEWM_IMAGE_H     ?= 224
 LEWM_IMAGE_W     ?= 448
@@ -131,7 +131,8 @@ train:
 	  --save_freq=$(SAVE_FREQ) \
 	  --log_freq=$(LOG_FREQ) \
 	  --eval_freq=$(STEPS) \
-	  --wandb.enable=$(WANDB)
+	  --wandb.enable=$(WANDB) \
+	  --tensorboard.enable=$(TENSORBOARD)
 
 eval:
 	$(DOCKER_RUN) lerobot-eval \

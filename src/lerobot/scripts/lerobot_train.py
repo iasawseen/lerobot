@@ -40,6 +40,7 @@ from lerobot.common.train_utils import (
     save_checkpoint,
     update_last_checkpoint,
 )
+from lerobot.common.tensorboard_utils import TensorBoardLogger
 from lerobot.common.wandb_utils import WandBLogger
 from lerobot.configs import parser
 from lerobot.configs.train import TrainPipelineConfig
@@ -201,11 +202,19 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             cpu=force_cpu,
         )
 
-    init_logging(accelerator=accelerator)
-
-    # Determine if this is the main process (for logging and checkpointing)
-    # When using accelerate, only the main process should log to avoid duplicate outputs
     is_main_process = accelerator.is_main_process
+
+    # Mirror stdout to a log file under the run directory so logs live next to
+    # the checkpoints. Only the main process writes the file to avoid two
+    # workers interleaving lines into the same handle.
+    log_file = None
+    if is_main_process:
+        log_dir = cfg.output_dir / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / "train.log"
+    # file_level="INFO" filters out PIL/httpx DEBUG spam that would otherwise
+    # fill the run log with megabytes of noise.
+    init_logging(log_file=log_file, file_level="INFO", accelerator=accelerator)
 
     # Only log on main process
     if is_main_process:
@@ -218,6 +227,8 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         wandb_logger = None
         if is_main_process:
             logging.info(colored("Logs will be saved locally.", "yellow", attrs=["bold"]))
+
+    tb_logger = TensorBoardLogger(cfg) if cfg.tensorboard.enable and is_main_process else None
 
     if cfg.seed is not None:
         set_seed(cfg.seed, accelerator=accelerator)
@@ -483,19 +494,27 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0 and is_main_process
         is_saving_step = step % cfg.save_freq == 0 or step == cfg.steps
         is_eval_step = cfg.eval_freq > 0 and step % cfg.eval_freq == 0
+        # Also seed loggers at step 1 so TB/wandb show data immediately on
+        # fresh runs instead of staying empty until step==log_freq.
+        is_first_step = step == 1 and is_main_process
 
-        if is_log_step:
-            logging.info(train_tracker)
-            if wandb_logger:
-                wandb_log_dict = train_tracker.to_dict()
+        if is_log_step or is_first_step:
+            if is_log_step:
+                logging.info(train_tracker)
+            if wandb_logger or tb_logger:
+                metrics_dict = train_tracker.to_dict()
                 if output_dict:
-                    wandb_log_dict.update(output_dict)
+                    metrics_dict.update(output_dict)
                 # Log sample weighting statistics if enabled
                 if sample_weighter is not None:
                     weighter_stats = sample_weighter.get_stats()
-                    wandb_log_dict.update({f"sample_weighting/{k}": v for k, v in weighter_stats.items()})
-                wandb_logger.log_dict(wandb_log_dict, step)
-            train_tracker.reset_averages()
+                    metrics_dict.update({f"sample_weighting/{k}": v for k, v in weighter_stats.items()})
+                if wandb_logger:
+                    wandb_logger.log_dict(metrics_dict, step)
+                if tb_logger:
+                    tb_logger.log_dict(metrics_dict, step)
+            if is_log_step:
+                train_tracker.reset_averages()
 
         if cfg.save_checkpoint and is_saving_step:
             if is_main_process:
@@ -559,10 +578,13 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 eval_tracker.eval_s = aggregated.pop("eval_s")
                 eval_tracker.avg_sum_reward = aggregated.pop("avg_sum_reward")
                 eval_tracker.pc_success = aggregated.pop("pc_success")
-                if wandb_logger:
-                    wandb_log_dict = {**eval_tracker.to_dict(), **eval_info}
-                    wandb_logger.log_dict(wandb_log_dict, step, mode="eval")
-                    wandb_logger.log_video(eval_info["overall"]["video_paths"][0], step, mode="eval")
+                if wandb_logger or tb_logger:
+                    eval_log_dict = {**eval_tracker.to_dict(), **eval_info}
+                    if wandb_logger:
+                        wandb_logger.log_dict(eval_log_dict, step, mode="eval")
+                        wandb_logger.log_video(eval_info["overall"]["video_paths"][0], step, mode="eval")
+                    if tb_logger:
+                        tb_logger.log_dict(eval_log_dict, step, mode="eval")
 
             accelerator.wait_for_everyone()
 
@@ -584,6 +606,9 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 unwrapped_model.push_model_to_hub(cfg)
             preprocessor.push_to_hub(active_cfg.repo_id)
             postprocessor.push_to_hub(active_cfg.repo_id)
+
+    if tb_logger is not None:
+        tb_logger.close()
 
     # Properly clean up the distributed process group
     accelerator.wait_for_everyone()
