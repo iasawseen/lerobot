@@ -30,11 +30,9 @@ GPU            ?=
 
 # Train
 DATASET_REPO   ?= HuggingFaceVLA/libero
-# OUTPUT_DIR     ?= outputs/train/sawseenvlawm_libero_10k_bs64_lewm1_lg_expert_lg_encoded_2xGPUs_bf16
-OUTPUT_DIR     ?= outputs/train/sawseenvlawm_libero_10k_bs64_lewm_proj_lge_scheduled_k10_2xGPUs_bf16
-# OUTPUT_DIR     ?= outputs/train/sawseenvlawm_libero_lora_r16_lewm1_lg_expert_lg_predicted_10k_bs64_2xGPUs_bf16
+OUTPUT_DIR     ?= outputs/train/sawseenvlawm_libero_12k_bs64_lewm_proj_lge_scheduled_k10_2xGPUs_bf16
 JOB_NAME       ?= sawseenvlawm_libero_latent_goal
-STEPS          ?= 10000
+STEPS          ?= 12000
 # bs=64 per GPU on 24 GB cards with LATENT_GOAL=true: the LATENT_GOAL expert adds ~98M
 # trainable params + ~2 extra tokens through the full VLM/expert stack on
 # top of the side-channel suffix. Drop bs further (32) if you also push
