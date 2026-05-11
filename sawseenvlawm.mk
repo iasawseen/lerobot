@@ -125,6 +125,19 @@ LATENT_GOAL_INJECT_DETACH ?= true
 # ~2-2.5× per-step wall time. Ignored when source=encoded.
 LATENT_GOAL_TRAIN_NUM_STEPS ?= 10
 
+# ── Phase B / MPC inference (eval-only) ──────────────────────────────
+# Activates the le-wm predictor rollout + LGE-z_g scoring on top of the
+# policy's anchor chunk at inference. All values are runtime knobs read
+# by the eval-mpc target; never used by train.
+MPC                ?= false
+MPC_SCHEME         ?= anchor_perturb  # anchor_perturb | cem
+MPC_NUM_CANDIDATES ?= 16
+MPC_NOISE_SCALE    ?= 0.1
+MPC_SCORE_SPACE    ?= post_proj       # post_proj | cls
+MPC_CEM_NUM_ITER   ?= 4
+MPC_CEM_TOPK       ?= 4
+MPC_CEM_BLEND      ?= 0.5
+
 TRAIN_LAUNCHER  = $(if $(filter-out 1,$(NUM_GPUS)),accelerate launch --multi_gpu --num_processes=$(NUM_GPUS) --mixed_precision=$(MIXED_PRECISION) -m lerobot.scripts.lerobot_train,lerobot-train)
 DOCKER_CUDA_ENV = $(if $(filter-out 1,$(NUM_GPUS)),-e CUDA_VISIBLE_DEVICES=$(shell python3 -c "print(','.join(str(i) for i in range($(NUM_GPUS))))"),)
 
@@ -153,7 +166,7 @@ DOCKER_RUN = docker run $(if $(GPU),--gpus device=$(GPU) -e MUJOCO_EGL_DEVICE_ID
 	  -w /lerobot \
 	  $(DOCKER_IMAGE)
 
-.PHONY: build train eval table
+.PHONY: build train eval eval-mpc table
 
 build:
 	docker build -f docker/Dockerfile.benchmark.libero -t $(DOCKER_IMAGE) .
@@ -200,6 +213,29 @@ eval:
 	  --policy.device=$(DEVICE) \
 	  --policy.n_action_steps=$(EVAL_N_ACTION_STEPS) \
 	  --policy.compile_model=false \
+	  --env.type=libero \
+	  --env.task=$(EVAL_TASKS) \
+	  --eval.n_episodes=$(EVAL_EPISODES) \
+	  --eval.batch_size=$(EVAL_BATCH) \
+	  --env.max_parallel_tasks=$(EVAL_PARALLEL)
+
+# Phase B / MPC eval: same as eval, plus the MPC inference path. Reuses
+# the existing checkpoint at $(EVAL_POLICY); MPC is a runtime overlay.
+eval-mpc:
+	$(DOCKER_RUN) lerobot-eval \
+	  --policy.path=$(EVAL_POLICY) \
+	  --policy.device=$(DEVICE) \
+	  --policy.n_action_steps=$(EVAL_N_ACTION_STEPS) \
+	  --policy.compile_model=false \
+	  --policy.mpc_enabled=true \
+	  --policy.mpc_scheme=$(MPC_SCHEME) \
+	  --policy.mpc_num_candidates=$(MPC_NUM_CANDIDATES) \
+	  --policy.mpc_noise_scale=$(MPC_NOISE_SCALE) \
+	  --policy.mpc_score_space=$(MPC_SCORE_SPACE) \
+	  --policy.mpc_cem_num_iter=$(MPC_CEM_NUM_ITER) \
+	  --policy.mpc_cem_topk=$(MPC_CEM_TOPK) \
+	  --policy.mpc_cem_anchor_blend=$(MPC_CEM_BLEND) \
+	  --policy.mpc_predictor_path=/lewm/$(LEWM_CKPT_NAME) \
 	  --env.type=libero \
 	  --env.task=$(EVAL_TASKS) \
 	  --eval.n_episodes=$(EVAL_EPISODES) \

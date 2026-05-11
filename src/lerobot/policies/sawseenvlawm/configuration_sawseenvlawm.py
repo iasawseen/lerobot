@@ -197,6 +197,50 @@ class SawSeenVLAWMConfig(PreTrainedConfig):
     # forward. Ignored when source="encoded" or inject_to_action=False.
     latent_goal_train_num_steps: int = 1
 
+    # ── Phase B: MPC inference with le-wm predictor ──────────────────
+    # Runtime-only addition. When True, ``sample_actions`` produces a
+    # deterministic *anchor* action chunk first, then samples N
+    # perturbations around it, rolls each through the le-wm predictor
+    # in latent space, scores against the Latent Goal Expert's z_g,
+    # and returns the argmin candidate. No training change — MPC is
+    # never activated during ``forward`` (only via ``sample_actions``).
+    mpc_enabled: bool = False
+    # ``"anchor_perturb"`` = single-shot MPC: anchor + N-1 Gaussian
+    # perturbations, pick argmin (anchor stays as candidate 0 so MPC
+    # is no-worse than the bare policy). ``"cem"`` = CEM outer loop
+    # over Gaussian perturbations centered on the anchor: M iters of
+    # (sample, score, fit topk Gaussian, resample), return best.
+    mpc_scheme: str = "anchor_perturb"
+    # Total candidates per scoring batch. anchor_perturb includes the
+    # anchor itself as candidate 0; cem uses this many candidates per
+    # CEM iter.
+    mpc_num_candidates: int = 16
+    # Gaussian noise scale for action perturbations (post-normalization
+    # action units; sawseenvlawm actions are unit-std-ish, so 0.1 ≈ 10%
+    # of action std).
+    mpc_noise_scale: float = 0.1
+    # Latent space the predictor rollout is scored in.
+    #   ``"post_proj"`` — apply le-wm's ``projector`` to z_t (encoded)
+    #     and to z_g (LGE output) so both live in the predictor's
+    #     supervision space. Recommended.
+    #   ``"cls"`` — compare predictor output against LGE-output CLS
+    #     directly. Mismatched spaces (predictor outputs post-proj),
+    #     but matches LGE training target exactly.
+    mpc_score_space: str = "post_proj"
+    # CEM outer-loop iterations (Scheme B only).
+    mpc_cem_num_iter: int = 4
+    # CEM elite set size (Scheme B only). Must be < mpc_num_candidates.
+    mpc_cem_topk: int = 4
+    # σ anchoring weight toward mpc_noise_scale across CEM iters: new_σ =
+    # elite.std() * (1 - blend) + mpc_noise_scale * blend. 1.0 = pure
+    # init σ each iter; 0.0 = σ drifts freely from elites. Scheme B only.
+    mpc_cem_anchor_blend: float = 0.5
+    # Path to a le-wm ``<name>_object.ckpt`` pickle that contains the
+    # full JEPA (encoder + projector + action_encoder + predictor +
+    # pred_proj). Falls back to ``lewm_encoder_path`` when None — the
+    # same pickle works for both since it stores the whole module.
+    mpc_predictor_path: str | None = None
+
     def __post_init__(self):
         super().__post_init__()
 
@@ -226,6 +270,51 @@ class SawSeenVLAWMConfig(PreTrainedConfig):
                 "latent_goal_train_num_steps must be ≥ 1; got "
                 f"{self.latent_goal_train_num_steps}"
             )
+        if self.mpc_enabled:
+            if not self.latent_goal_enabled:
+                raise ValueError(
+                    "mpc_enabled=True requires latent_goal_enabled=True — the Latent "
+                    "Goal Expert is the source of z_g that MPC scores candidates against."
+                )
+            if not self.lewm_encoder_path and not self.mpc_predictor_path:
+                raise ValueError(
+                    "mpc_enabled=True requires a le-wm checkpoint (set "
+                    "lewm_encoder_path or mpc_predictor_path)."
+                )
+            if self.mpc_num_candidates < 2:
+                raise ValueError(
+                    "mpc_num_candidates must be ≥ 2 (anchor + at least one "
+                    f"perturbation); got {self.mpc_num_candidates}"
+                )
+            if self.mpc_scheme not in ("anchor_perturb", "cem"):
+                raise ValueError(
+                    f"mpc_scheme must be 'anchor_perturb' or 'cem'; got {self.mpc_scheme!r}"
+                )
+            if self.mpc_score_space not in ("post_proj", "cls"):
+                raise ValueError(
+                    f"mpc_score_space must be 'post_proj' or 'cls'; got {self.mpc_score_space!r}"
+                )
+            if self.mpc_scheme == "cem":
+                if self.mpc_cem_topk >= self.mpc_num_candidates:
+                    raise ValueError(
+                        "mpc_cem_topk must be < mpc_num_candidates; got "
+                        f"topk={self.mpc_cem_topk}, num_candidates={self.mpc_num_candidates}"
+                    )
+                if self.mpc_cem_num_iter < 1:
+                    raise ValueError(
+                        f"mpc_cem_num_iter must be ≥ 1; got {self.mpc_cem_num_iter}"
+                    )
+                if not (0.0 <= self.mpc_cem_anchor_blend <= 1.0):
+                    raise ValueError(
+                        "mpc_cem_anchor_blend must be in [0, 1]; got "
+                        f"{self.mpc_cem_anchor_blend}"
+                    )
+            if self.rtc_config is not None and self.rtc_config.enabled:
+                raise ValueError(
+                    "mpc_enabled and RTC are mutually exclusive — RTC partially "
+                    "re-denoises chunks mid-execution, while MPC filters the full "
+                    "chunk; combining them is not specified."
+                )
 
     def validate_features(self) -> None:
         for i in range(self.empty_cameras):

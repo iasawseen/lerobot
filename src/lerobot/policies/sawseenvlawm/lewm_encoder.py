@@ -253,3 +253,170 @@ class LeWMVisionEncoder(nn.Module):
 
         hidden = out.last_hidden_state  # (B, 1+P*P, 192)
         return hidden[:, : self.num_tokens]
+
+
+class LeWMWorldModel(nn.Module):
+    """Full le-wm JEPA module lifted from a `<name>_object.ckpt` pickle.
+
+    Wraps the same `LeWMVisionEncoder` (for image preprocessing + ViT) and
+    additionally exposes the projector, action_encoder, predictor, and
+    pred_proj sub-modules. Used by Phase B / MPC inference to roll
+    candidate action chunks forward in latent space.
+
+    All sub-modules are frozen by default — this is an inference-only
+    consumer; the SawSeenVLAWM training loss path never touches it.
+    """
+
+    output_dim: int = 192  # ViT-Tiny hidden / post-projector emb dim
+    history_size: int = 3  # le-wm `wm.history_size` default
+
+    def __init__(
+        self,
+        num_tokens: int = 192,
+        image_height: int = 224,
+        image_width: int = 448,
+        patch_size: int = 14,
+        freeze: bool = True,
+    ):
+        super().__init__()
+        # Reuses the vision wrapper's normalize/resize/cast path and ViT.
+        self._vision = LeWMVisionEncoder(
+            num_tokens=num_tokens,
+            image_height=image_height,
+            image_width=image_width,
+            patch_size=patch_size,
+            freeze=freeze,
+        )
+        # Populated by ``from_lewm_checkpoint`` — typed as Module so torch
+        # registers them; None until loaded.
+        self.projector: nn.Module | None = None
+        self.action_encoder: nn.Module | None = None
+        self.predictor: nn.Module | None = None
+        self.pred_proj: nn.Module | None = None
+        self.freeze = freeze
+
+    @property
+    def encoder(self) -> LeWMVisionEncoder:
+        return self._vision
+
+    @classmethod
+    def from_lewm_checkpoint(
+        cls,
+        ckpt_path: str | Path,
+        num_tokens: int = 192,
+        image_height: int = 224,
+        image_width: int = 448,
+        patch_size: int = 14,
+        freeze: bool = True,
+    ) -> "LeWMWorldModel":
+        """Load encoder + projector + action_encoder + predictor + pred_proj
+        from a le-wm `<name>_object.ckpt`.
+
+        Same pickle as `LeWMVisionEncoder.from_lewm_checkpoint`, but
+        retains all five sub-modules instead of dropping the predictor
+        side. The JEPA / module python files must be importable to unpickle.
+        """
+        ckpt_path = Path(ckpt_path)
+        if not ckpt_path.exists():
+            raise FileNotFoundError(f"le-wm checkpoint not found: {ckpt_path}")
+
+        model = cls(
+            num_tokens=num_tokens,
+            image_height=image_height,
+            image_width=image_width,
+            patch_size=patch_size,
+            freeze=freeze,
+        )
+        try:
+            obj = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to unpickle {ckpt_path}. The le-wm `JEPA` and "
+                f"`module` python files must be importable. Add le-wm to "
+                f"PYTHONPATH or vendor the classes. Original error: {e}"
+            ) from e
+
+        for required in ("encoder", "projector", "action_encoder", "predictor", "pred_proj"):
+            if not hasattr(obj, required):
+                raise RuntimeError(
+                    f"Unexpected checkpoint structure in {ckpt_path}: missing "
+                    f".{required}. Got type {type(obj).__name__}."
+                )
+
+        encoder_state = obj.encoder.state_dict()
+        missing, unexpected = model._vision.vit.load_state_dict(encoder_state, strict=False)
+        if missing or unexpected:
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "le-wm encoder load: missing=%s unexpected=%s",
+                list(missing)[:5],
+                list(unexpected)[:5],
+            )
+
+        # Attach the rest as-is. They are full nn.Module instances with
+        # their state loaded — assignment registers them on the parent.
+        model.projector = obj.projector
+        model.action_encoder = obj.action_encoder
+        model.predictor = obj.predictor
+        model.pred_proj = obj.pred_proj
+
+        if freeze:
+            for p in model.parameters():
+                p.requires_grad = False
+        return model
+
+    @torch.no_grad()
+    def encode_cls(self, images: list[Tensor]) -> Tensor:
+        """Encode camera-concatenated images and return CLS token (B, 192).
+
+        Mirrors `SawSeenVLAWMModel._encode_lewm_cls`: when more than one
+        camera is provided, concatenate horizontally before encoding so
+        the ViT sees the same layout as le-wm training.
+        """
+        if len(images) == 1:
+            stacked = images[0]
+        else:
+            stacked = torch.cat(images, dim=-1)
+        tokens = self._vision(stacked)  # (B, num_tokens, 192)
+        return tokens[:, 0, :]
+
+    @torch.no_grad()
+    def project(self, cls: Tensor) -> Tensor:
+        """Apply le-wm's MLP projector to a CLS token: (B, 192) → (B, 192).
+
+        Output lives in the same space the predictor was supervised
+        against (post-projector embedding). Use this on both z_t and z_g
+        before scoring predictor rollouts.
+        """
+        assert self.projector is not None, "LeWMWorldModel not loaded — call from_lewm_checkpoint"
+        param = next(self.projector.parameters())
+        return self.projector(cls.to(param.dtype))
+
+    @torch.no_grad()
+    def encode_actions(self, actions: Tensor) -> Tensor:
+        """Run le-wm's action_encoder. ``actions``: (B, T, A_raw); returns (B, T, 192)."""
+        assert self.action_encoder is not None, "LeWMWorldModel not loaded — call from_lewm_checkpoint"
+        param = next(self.action_encoder.parameters())
+        return self.action_encoder(actions.to(param.dtype))
+
+    @torch.no_grad()
+    def predict_step(self, emb: Tensor, act_emb: Tensor) -> Tensor:
+        """One predictor call: (emb, act_emb) → predicted emb sequence.
+
+        ``emb``: (B, T, 192), ``act_emb``: (B, T, 192). Output (B, T, 192)
+        where position i predicts emb at time i+1 (matches le-wm training:
+        `ctx_emb = emb[:, :ctx_len]`, `tgt_emb = emb[:, n_preds:]`).
+        Callers should take ``[:, -1:, :]`` as the "next frame" prediction
+        after the last action in the window.
+        """
+        assert self.predictor is not None and self.pred_proj is not None, (
+            "LeWMWorldModel not loaded — call from_lewm_checkpoint"
+        )
+        param = next(self.predictor.parameters())
+        emb = emb.to(param.dtype)
+        act_emb = act_emb.to(param.dtype)
+        preds = self.predictor(emb, act_emb)  # (B, T, hidden=192)
+        B, T, D = preds.shape
+        preds = self.pred_proj(preds.reshape(B * T, D))
+        return preds.reshape(B, T, -1)

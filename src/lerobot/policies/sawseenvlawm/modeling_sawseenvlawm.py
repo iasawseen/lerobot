@@ -63,7 +63,7 @@ from ..utils import (
     populate_queues,
 )
 from .configuration_sawseenvlawm import SawSeenVLAWMConfig
-from .lewm_encoder import LeWMVisionEncoder
+from .lewm_encoder import LeWMVisionEncoder, LeWMWorldModel
 
 
 class ActionSelectKwargs(TypedDict, total=False):
@@ -785,6 +785,24 @@ class VLAFlowMatching(nn.Module):
                 "which is only available when the encoder is loaded."
             )
 
+        # Phase B / MPC: full le-wm JEPA (encoder + projector +
+        # action_encoder + predictor + pred_proj). Loaded only when MPC
+        # is enabled — the training loss path never touches this module.
+        # The pickle is the same as ``lewm_encoder_path`` (the encoder
+        # we already loaded above is one of its sub-modules), so we can
+        # fall back to that path when ``mpc_predictor_path`` is unset.
+        self.lewm_world: LeWMWorldModel | None = None
+        if self.config.mpc_enabled:
+            predictor_path = self.config.mpc_predictor_path or self.config.lewm_encoder_path
+            self.lewm_world = LeWMWorldModel.from_lewm_checkpoint(
+                predictor_path,
+                num_tokens=self.config.lewm_num_tokens,
+                image_height=self.config.lewm_image_height,
+                image_width=self.config.lewm_image_width,
+                patch_size=self.config.lewm_patch_size,
+                freeze=True,
+            )
+
         self.set_requires_grad()
         self.fake_image_token = self.vlm_with_expert.processor.tokenizer.fake_image_token_id
         self.global_image_token = self.vlm_with_expert.processor.tokenizer.global_image_token_id
@@ -1365,37 +1383,34 @@ class VLAFlowMatching(nn.Module):
             losses = F.mse_loss(u_t, v_t, reduction="none")
         return losses, latent_goal_loss
 
-    def sample_actions(
+    def _build_inference_context(
         self,
         images,
         img_masks,
         lang_tokens,
         lang_masks,
         state,
-        noise=None,
-        **kwargs: Unpack[ActionSelectKwargs],
-    ) -> Tensor:
-        """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
+    ) -> dict:
+        """Build the per-step VLM prefix cache + (optionally) LGE state.
+
+        Centralizes the pre-denoising work shared between the standard
+        sampling path and Phase B / MPC. Returns a dict with:
+          - bsize, device
+          - suffix_lewm_tokens (or None)
+          - prefix_pad_masks, past_key_values
+          - latent_goal_inject_tokens (or None)  — Mode 3 only
+          - z_t_cls, z_g_cls (or None each)      — only when LGE active
+        """
         bsize = state.shape[0]
         device = state.device
 
-        if noise is None:
-            actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
-            noise = self.sample_noise(actions_shape, device)
-
-        # le-wm tokens are static across denoising steps; compute once.
-        # ``compute_lewm_tokens`` returns None when ``lewm_inject_to="none"``
-        # (encoder loaded but no action-expert injection).
         suffix_lewm_tokens = self.compute_lewm_tokens(images)
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks, state=state
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
-        # Compute image and language key value cache. In Mode 3 we go
-        # through the n-stream path so both experts can read the cache;
-        # use a length-3 ``inputs_embeds`` to switch the wrapper away from
-        # the parent's single-expert fallback.
+
         mode3 = (
             self.config.latent_goal_enabled and self.config.latent_goal_inject_to_action
         )
@@ -1409,22 +1424,53 @@ class VLAFlowMatching(nn.Module):
             fill_kv_cache=True,
         )
 
-        # Mode 3: produce a clean z_g once via K-step LGE denoising on top
-        # of the cached VLM prefix, then prepend [z_t, z_g] as fixed tokens
-        # to every action denoising step.
         latent_goal_inject_tokens: torch.Tensor | None = None
+        z_t_cls: torch.Tensor | None = None
+        z_g_cls: torch.Tensor | None = None
         if mode3:
-            z_t_anchor = self._encode_lewm_cls(images)
-            z_g_clean = self._latent_goal_denoise(
-                z_t_anchor, prefix_pad_masks, past_key_values
-            )
+            z_t_cls = self._encode_lewm_cls(images)
+            z_g_cls = self._latent_goal_denoise(z_t_cls, prefix_pad_masks, past_key_values)
             zt_emb = self.latent_goal_action_zt_proj(
-                z_t_anchor.to(self.latent_goal_action_zt_proj.weight.dtype)
+                z_t_cls.to(self.latent_goal_action_zt_proj.weight.dtype)
             )
             zg_emb = self.latent_goal_action_zg_proj(
-                z_g_clean.to(self.latent_goal_action_zg_proj.weight.dtype)
+                z_g_cls.to(self.latent_goal_action_zg_proj.weight.dtype)
             )
             latent_goal_inject_tokens = torch.stack([zt_emb, zg_emb], dim=1)
+        elif self.config.mpc_enabled:
+            # MPC without Mode 3 still needs both anchors for predictor
+            # rollout + scoring. Compute them here on the same cache.
+            z_t_cls = self._encode_lewm_cls(images)
+            z_g_cls = self._latent_goal_denoise(z_t_cls, prefix_pad_masks, past_key_values)
+
+        return {
+            "bsize": bsize,
+            "device": device,
+            "suffix_lewm_tokens": suffix_lewm_tokens,
+            "prefix_pad_masks": prefix_pad_masks,
+            "past_key_values": past_key_values,
+            "latent_goal_inject_tokens": latent_goal_inject_tokens,
+            "z_t_cls": z_t_cls,
+            "z_g_cls": z_g_cls,
+        }
+
+    def _denoise_action_chunk(
+        self,
+        ctx: dict,
+        noise: Tensor,
+        **kwargs: Unpack[ActionSelectKwargs],
+    ) -> Tensor:
+        """Standard num_steps flow-matching denoising loop.
+
+        Inputs come from ``_build_inference_context``. Output shape:
+        (B, chunk_size, max_action_dim) — padded action space.
+        """
+        device = ctx["device"]
+        bsize = ctx["bsize"]
+        prefix_pad_masks = ctx["prefix_pad_masks"]
+        past_key_values = ctx["past_key_values"]
+        suffix_lewm_tokens = ctx["suffix_lewm_tokens"]
+        latent_goal_inject_tokens = ctx["latent_goal_inject_tokens"]
 
         num_steps = self.config.num_steps
         dt = -1.0 / num_steps
@@ -1466,6 +1512,225 @@ class VLAFlowMatching(nn.Module):
                 self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
 
         return x_t
+
+    def sample_actions(
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        state,
+        noise=None,
+        **kwargs: Unpack[ActionSelectKwargs],
+    ) -> Tensor:
+        """Do a full inference forward and compute the action (batch_size x num_steps x num_motors).
+
+        When ``mpc_enabled`` is set, this dispatches to MPC: build the
+        anchor chunk via the standard denoising loop, then refine it
+        against the LGE goal via le-wm predictor rollouts. MPC is
+        eval-only by construction — it lives behind ``sample_actions``,
+        which is invoked from the policy's ``@torch.no_grad()``
+        ``select_action`` / ``predict_action_chunk`` only.
+        """
+        bsize = state.shape[0]
+        device = state.device
+
+        if noise is None:
+            actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
+            noise = self.sample_noise(actions_shape, device)
+
+        ctx = self._build_inference_context(
+            images, img_masks, lang_tokens, lang_masks, state
+        )
+
+        if self.config.mpc_enabled:
+            return self._mpc_sample_actions(ctx, noise, **kwargs)
+
+        return self._denoise_action_chunk(ctx, noise, **kwargs)
+
+    # ── Phase B / MPC inference path ───────────────────────────────────
+
+    def _mpc_sample_actions(
+        self,
+        ctx: dict,
+        noise: Tensor,
+        **kwargs: Unpack[ActionSelectKwargs],
+    ) -> Tensor:
+        """Anchor-based MPC. Returns (B, chunk_size, max_action_dim).
+
+        Steps:
+          1. Run the policy's standard denoising once to get the clean
+             anchor chunk ``a*``.
+          2. Compute (z_t, z_g) in the configured scoring space.
+          3. Sample N candidate action chunks per the configured scheme,
+             roll each through the le-wm predictor, score against z_g.
+          4. Return the argmin candidate's chunk, re-padded to max
+             action dim.
+
+        The anchor is always candidate 0 in ``anchor_perturb`` so MPC
+        cannot make the policy strictly worse — if scoring is
+        uncalibrated, the anchor still wins.
+        """
+        # (1) Anchor pass at original batch size.
+        anchor_padded = self._denoise_action_chunk(ctx, noise, **kwargs)
+        action_dim = self.config.action_feature.shape[0]
+        anchor = anchor_padded[..., :action_dim]  # (B, T, A_raw)
+
+        # (2) Scoring-space latents.
+        z_t_emb, z_g_emb = self._build_mpc_targets(ctx)
+
+        # (3) Pick candidates per scheme.
+        if self.config.mpc_scheme == "cem":
+            best_raw = self._cem_search(z_t_emb, z_g_emb, anchor)
+        else:
+            best_raw = self._anchor_perturb_search(z_t_emb, z_g_emb, anchor)
+
+        # (4) Re-pad to max_action_dim. The trailing pad slots stay zero
+        #     to match what the action expert would emit there.
+        out = anchor_padded.clone()
+        out[..., :action_dim] = best_raw
+        return out
+
+    def _build_mpc_targets(self, ctx: dict) -> tuple[Tensor, Tensor]:
+        """Map z_t / z_g into the configured scoring space.
+
+        ``post_proj`` applies le-wm's MLP projector to both — same space
+        the predictor was supervised against. ``cls`` keeps both in raw
+        CLS space (mismatched against predictor output, but matches
+        LGE's training target).
+        """
+        z_t_cls = ctx["z_t_cls"]
+        z_g_cls = ctx["z_g_cls"]
+        assert z_t_cls is not None and z_g_cls is not None, (
+            "_build_mpc_targets called without LGE state — should be unreachable"
+        )
+        if self.config.mpc_score_space == "post_proj":
+            z_t_emb = self.lewm_world.project(z_t_cls)
+            z_g_emb = self.lewm_world.project(z_g_cls)
+        else:
+            z_t_emb, z_g_emb = z_t_cls, z_g_cls
+        return z_t_emb.to(torch.float32), z_g_emb.to(torch.float32)
+
+    def _anchor_perturb_search(
+        self,
+        z_t_emb: Tensor,
+        z_g_emb: Tensor,
+        anchor: Tensor,
+    ) -> Tensor:
+        """Scheme A. Returns best candidate per batch element: (B, T, A_raw)."""
+        B, T, A = anchor.shape
+        N = self.config.mpc_num_candidates
+        sigma = self.config.mpc_noise_scale
+        device = anchor.device
+
+        # Candidate 0 = anchor; rest = anchor + sigma * eps.
+        eps = torch.randn(B, N - 1, T, A, device=device, dtype=anchor.dtype)
+        candidates = torch.cat(
+            [anchor.unsqueeze(1), anchor.unsqueeze(1) + sigma * eps],
+            dim=1,
+        )  # (B, N, T, A)
+
+        cost = self._lewm_rollout_score(z_t_emb, z_g_emb, candidates)  # (B, N)
+        best = cost.argmin(dim=1)  # (B,)
+        return candidates[torch.arange(B, device=device), best]
+
+    def _cem_search(
+        self,
+        z_t_emb: Tensor,
+        z_g_emb: Tensor,
+        anchor: Tensor,
+    ) -> Tensor:
+        """Scheme B. CEM over Gaussian perturbations centered on the anchor."""
+        B, T, A = anchor.shape
+        N = self.config.mpc_num_candidates
+        sigma_init = self.config.mpc_noise_scale
+        blend = self.config.mpc_cem_anchor_blend
+        topk = self.config.mpc_cem_topk
+        num_iter = self.config.mpc_cem_num_iter
+        device = anchor.device
+        dtype = anchor.dtype
+        batch_idx = torch.arange(B, device=device)
+
+        mu = anchor.clone()  # (B, T, A)
+        sigma = torch.full_like(anchor, sigma_init)
+
+        # Track the best candidate ever seen, in case later CEM iters
+        # drift to a worse region.
+        anchor_cost = self._lewm_rollout_score(z_t_emb, z_g_emb, anchor.unsqueeze(1)).squeeze(1)
+        best_cost = anchor_cost
+        best_actions = anchor.clone()
+
+        for _ in range(num_iter):
+            eps = torch.randn(B, N, T, A, device=device, dtype=dtype)
+            candidates = mu.unsqueeze(1) + sigma.unsqueeze(1) * eps  # (B, N, T, A)
+            cost = self._lewm_rollout_score(z_t_emb, z_g_emb, candidates)  # (B, N)
+
+            elite_idx = cost.topk(topk, dim=1, largest=False).indices  # (B, K)
+            elite = candidates[batch_idx[:, None], elite_idx]  # (B, K, T, A)
+            mu = elite.mean(dim=1)
+            sigma_new = elite.std(dim=1)
+            sigma = sigma_new * (1 - blend) + sigma_init * blend
+
+            iter_best = cost.argmin(dim=1)
+            iter_cost = cost[batch_idx, iter_best]
+            iter_actions = candidates[batch_idx, iter_best]
+            improved = iter_cost < best_cost
+            best_cost = torch.where(improved, iter_cost, best_cost)
+            improved_mask = improved.view(B, 1, 1).expand_as(best_actions)
+            best_actions = torch.where(improved_mask, iter_actions, best_actions)
+
+        return best_actions
+
+    def _lewm_rollout_score(
+        self,
+        z_t_emb: Tensor,
+        z_g_emb: Tensor,
+        candidates: Tensor,
+    ) -> Tensor:
+        """Roll candidate action chunks through le-wm and score vs z_g.
+
+        Args:
+            z_t_emb: (B, 192) current latent in scoring space.
+            z_g_emb: (B, 192) goal latent in scoring space.
+            candidates: (B, N, T, A_raw) candidate action chunks.
+
+        Returns:
+            cost: (B, N) sum-of-squares distance between the final
+            predicted latent and z_g.
+
+        History fabrication: le-wm trained with history_size=3; we only
+        have one real frame (z_t). We pad to HS=3 by repeating z_t and
+        prefix HS-1 zero actions, so the first prediction effectively
+        treats the past as static. Each iter then takes the last HS
+        (emb, action) pairs and predicts the next frame. Only the final
+        emb (z_{t+T}) feeds the cost.
+        """
+        assert self.lewm_world is not None, "MPC enabled without lewm_world loaded"
+        B, N, T, A = candidates.shape
+        HS = self.lewm_world.history_size
+        device = candidates.device
+
+        flat = candidates.reshape(B * N, T, A)
+        z_t_flat = z_t_emb.repeat_interleave(N, dim=0)  # (B*N, 192)
+        z_g_flat = z_g_emb.repeat_interleave(N, dim=0)  # (B*N, 192)
+
+        hist_emb = z_t_flat.unsqueeze(1).expand(-1, HS, -1).contiguous()  # (B*N, HS, 192)
+        # Zero actions for the fabricated past (the HS-1 "before-now" slots).
+        # Each predict call sees the last HS (emb, action) pairs and
+        # predicts the next emb at position -1.
+        hist_act = torch.zeros(B * N, HS - 1, A, device=device, dtype=flat.dtype)
+
+        for t in range(T):
+            hist_act = torch.cat([hist_act, flat[:, t : t + 1, :]], dim=1)
+            emb_win = hist_emb[:, -HS:]
+            act_win = hist_act[:, -HS:]
+            act_emb = self.lewm_world.encode_actions(act_win)
+            pred = self.lewm_world.predict_step(emb_win, act_emb)  # (B*N, HS, 192)
+            hist_emb = torch.cat([hist_emb, pred[:, -1:, :].to(hist_emb.dtype)], dim=1)
+
+        z_final = hist_emb[:, -1].to(torch.float32)  # (B*N, 192)
+        cost = ((z_final - z_g_flat) ** 2).sum(dim=-1)  # (B*N,)
+        return cost.view(B, N)
 
     def denoise_step(
         self,
