@@ -121,6 +121,14 @@ class SawSeenVLAKIConfig(PreTrainedConfig):
     # may need calibration if CE-in-nats and MSE-in-action-units² differ
     # too much in magnitude.
     ki_loss_weight: float = 1.0
+    # Whether to detach the VLM K/V tensors going into the action
+    # expert (the "I" in KI). True (default) is paper-faithful: the
+    # flow-matching gradient never reaches the VLM, so VLM LoRA is
+    # adapted by FAST CE only. False keeps CE as a pure auxiliary —
+    # both FM and CE update VLM LoRA. Useful on LoRA-budget hardware
+    # where the ~1 M-param LoRA subspace can't be split between two
+    # objectives without the action expert paying a steep cost.
+    ki_detach: bool = True
 
     # Path / repo id of the FAST action tokenizer (HuggingFace Hub).
     # The released ``lerobot/fast-action-tokenizer`` was trained on a

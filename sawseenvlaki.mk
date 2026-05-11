@@ -25,7 +25,7 @@ GPU            ?=
 
 # Train
 DATASET_REPO   ?= HuggingFaceVLA/libero
-OUTPUT_DIR     ?= outputs/train/sawseenvlaki_lora_r_16_libero_24k_bs32_2xGPUs_bf16
+OUTPUT_DIR     ?= outputs/train/sawseenvlaki_nodetach_kiw0.1_lora_r_16_libero_24k_bs32_2xGPUs_bf16
 JOB_NAME       ?= sawseenvlaki_libero
 STEPS          ?= 24000
 # bs=32 (vs sawseenvla bs=64) compensates for the FAST tokens
@@ -61,7 +61,15 @@ LORA_R           ?= 16
 # identical SawSeenVLA (registered separately so checkpoints don't
 # collide).
 KI               ?= true
-KI_LOSS_WEIGHT   ?= 1.0
+KI_LOSS_WEIGHT   ?= 0.1
+# Whether to apply the KI detach barrier on the VLM K/V going into
+# the action expert. true = paper-faithful KI (FM gradient never
+# reaches VLM, VLM LoRA is adapted by CE alone). false = "auxiliary
+# FAST head" mode: FM gradient still reaches VLM LoRA, CE is purely
+# additive. Use false on LoRA-budget hardware where the small LoRA
+# subspace can't be split between FM and CE without action loss
+# stalling.
+KI_DETACH        ?= false
 # Right-pad bound for the FAST token sequence per chunk. Real lengths
 # for LIBERO chunks (chunk_size=50, action_dim=7) span 100-145 tokens
 # depending on chunk content; 160 covers the tail with margin and a
@@ -114,6 +122,7 @@ train:
 	  --policy.pad_language_to=$(PAD_LANGUAGE_TO) \
 	  --policy.ki_enabled=$(KI) \
 	  --policy.ki_loss_weight=$(KI_LOSS_WEIGHT) \
+	  --policy.ki_detach=$(KI_DETACH) \
 	  --policy.fast_max_action_tokens=$(FAST_MAX_TOKENS) \
 	  --policy.fast_vocab_size=$(FAST_VOCAB_SIZE) \
 	  --dataset.repo_id=$(DATASET_REPO) \

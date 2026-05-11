@@ -273,7 +273,7 @@ class VLAFlowMatchingKI(VLAFlowMatching):
             inputs_embeds=[prefix_embs, suffix_embs],
             use_cache=False,
             fill_kv_cache=False,
-            detach_kv_for_expert=True,
+            detach_kv_for_expert=self.config.ki_detach,
         )
 
         # ---- action loss (flow-matching MSE) ----
