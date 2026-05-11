@@ -7,11 +7,11 @@ training signal, controlled by independent flags:
    expert's suffix. Implemented and ablated; **parked** after the 1k-step
    runs all clustered with the no-lewm baseline (see "Empirical results
    (parked)" below). Code stays in place.
-2. **Latent Goal Predictor (Phase A — active)** — a second flow-matching
+2. **Latent Goal Expert (Phase A — active)** — a second flow-matching
    expert sitting layer-by-layer next to the action expert on the shared
    VLM backbone, trained to predict `z_{t+chunk_size}` in le-wm space
    given `(prefix, language goal, z_t anchor)`. Action-blind by
-   construction. See the [Latent Goal Predictor](#latent-goal-predictor-phase-a--active)
+   construction. See the [Latent Goal Expert](#latent-goal-expert-phase-a--active)
    section for the full architecture, and
    [`design/future-sight-implicit-wm.md`](./future-sight-implicit-wm.md)
    for the broader single-latent implicit-WM synthesis.
@@ -230,7 +230,7 @@ Key observations:
 
 ---
 
-## Latent Goal Predictor (Phase A — active)
+## Latent Goal Expert (Phase A — active)
 
 A second flow-matching expert that sits **next to the action expert on the
 shared SmolVLM backbone**, trained to predict the chunk-end frame's le-wm
@@ -246,12 +246,12 @@ section documents the SawSeenVLAWM-specific implementation.
 - The side-channel ablations showed that *adding one more visual stream
   to the action expert* doesn't move action loss — the SmolVLM/SigLIP
   prefix already supplies rich vision.
-- The LGP is a different bet: instead of feeding le-wm features to the
+- The Latent Goal Expert is a different bet: instead of feeding le-wm features to the
   action expert, train a *second head* on the same backbone to predict
   the **goal state** in le-wm space. The shared cost is one extra
   ViT-Tiny encoder pass per step (cheap); the marginal gain is a
   goal-target generator that maps language to le-wm geometry.
-- This unlocks Phase B (MPC inner loop): given `z_g` from LGP and `z_t`
+- This unlocks Phase B (MPC inner loop): given `z_g` from Latent Goal Expert and `z_t`
   from the encoder, score K perturbations of the action chunk by
   `d(WM(z_t, a*_k), z_g)` — both endpoints anchored in the same space.
 
@@ -265,25 +265,25 @@ section documents the SawSeenVLAWM-specific implementation.
                        │                       │
               ┌────────┴────────┐    ┌─────────┴───────────┐
               │  Action Expert  │    │  Latent Goal        │
-              │  (existing,     │    │  Predictor (LGP)    │
+              │  (existing,     │    │  Predictor (Latent Goal Expert)    │
               │   own weights)  │    │  (new, 720-d, 16L)  │
               └────────┬────────┘    └─────────┬───────────┘
                        │                       │
                   50 noisy actions      [ z_t_anchor , noisy_z_g + time ]
-                                        (2-token LGP suffix)
+                                        (2-token Latent Goal Expert suffix)
                        │                       │
-                action_out_proj          lgp_out_proj
+                action_out_proj          latent_goal_out_proj
                        │                       │
-                v_action (B, 50, 32)     v_lgp (B, 192)
+                v_action (B, 50, 32)     v_latent_goal (B, 192)
                        │                       │
-                  L_action (MSE)         L_lgp (MSE)
+                  L_action (MSE)         L_latent_goal (MSE)
                        └──────────┬────────────┘
                                   │
-                       L = L_action + λ · L_lgp
+                       L = L_action + λ · L_latent_goal
 
-  Action ↔ LGP attention: blocked in both directions.
-    - Action → LGP:  cumulative-mask ordering (LGP sits after actions)
-    - LGP → Action:  custom 2D-mask edit (att_2d_masks[lgp:, suffix:] = False)
+  Action ↔ Latent Goal Expert attention: blocked in both directions.
+    - Action → Latent Goal Expert:  cumulative-mask ordering (Latent Goal Expert sits after actions)
+    - Latent Goal Expert → Action:  custom 2D-mask edit (att_2d_masks[latent_goal:, suffix:] = False)
 ```
 
 Each expert has its **own weights, projections, depth, and width**. They
@@ -293,54 +293,54 @@ the existing single-expert path: half the layers do self-attn (Q/K/V
 concatenated and split per stream), the other half do cross-attn (each
 expert reads VLM K/V via its own re-projection).
 
-### LGP suffix structure
+### Latent Goal Expert suffix structure
 
 ```
-LGP suffix = [ z_t_anchor , noisy_z_g + time ]    # 2 tokens, both 720-dim
+Latent Goal Expert suffix = [ z_t_anchor , noisy_z_g + time ]    # 2 tokens, both 720-dim
 
-z_t_anchor  : lgp_anchor_proj( lewm_encoder(o_t)[:, 0, :] )
-              # CLS token of the current frame, projected into LGP hidden.
-              # Frozen, deterministic — the LGP expert's "where am I now."
+z_t_anchor  : latent_goal_anchor_proj( lewm_encoder(o_t)[:, 0, :] )
+              # CLS token of the current frame, projected into Latent Goal Expert hidden.
+              # Frozen, deterministic — the Latent Goal Expert's "where am I now."
 
-noisy_z_g+t : lgp_time_mlp_out( silu( lgp_time_mlp_in( [lgp_in_proj(noisy_z), sin_cos_time] ) ) )
+noisy_z_g+t : latent_goal_time_mlp_out( silu( latent_goal_time_mlp_in( [latent_goal_in_proj(noisy_z), sin_cos_time] ) ) )
               # Standard flow-matching denoising token.
               # Velocity is read from this position only (anchor's output
               # is discarded — it has no flow-matching role).
 ```
 
-Within the LGP suffix the two tokens share one attention block
+Within the Latent Goal Expert suffix the two tokens share one attention block
 (`att_mask=[1, 0]`) so they're bidirectional — the denoising token reads
 the anchor at every layer, and vice versa.
 
 ### Action-blindness — the 2D-mask edit
 
-The cumulative `att_mask` scheme would let LGP read action tokens (LGP sits
-after actions in the suffix → higher cumsum → LGP sees actions). To enforce
-"LGP predicts the goal state independent of the action chunk", we zero out
-the LGP-rows × suffix-columns quadrant of the 2D attention mask after
+The cumulative `att_mask` scheme would let Latent Goal Expert read action tokens (Latent Goal Expert sits
+after actions in the suffix → higher cumsum → Latent Goal Expert sees actions). To enforce
+"Latent Goal Expert predicts the goal state independent of the action chunk", we zero out
+the Latent Goal Expert-rows × suffix-columns quadrant of the 2D attention mask after
 building it the standard way:
 
 ```python
 att_2d_masks = make_att_2d_masks(pad_masks, att_masks)      # cumulative
-lgp_start = prefix_len + suffix_len                          # LGP tokens start here
-att_2d_masks[:, lgp_start:, prefix_len:lgp_start] = False    # block LGP → suffix
+latent_goal_start = prefix_len + suffix_len                          # Latent Goal Expert tokens start here
+att_2d_masks[:, latent_goal_start:, prefix_len:latent_goal_start] = False    # block Latent Goal Expert → suffix
 ```
 
-So LGP attends to: prefix (image, language, state) plus its own anchor +
+So Latent Goal Expert attends to: prefix (image, language, state) plus its own anchor +
 denoise tokens. Nothing in the action expert's suffix.
 
-The reverse direction (action → LGP) is already blocked by cumulative
-ordering — actions have lower cumsum than LGP tokens.
+The reverse direction (action → Latent Goal Expert) is already blocked by cumulative
+ordering — actions have lower cumsum than Latent Goal Expert tokens.
 
-This makes the action expert and the LGP expert **conditionally
+This makes the action expert and the Latent Goal Expert **conditionally
 independent given the prefix**. Both branches use the same multimodal
 context but never see each other.
 
 ### Why "predict goal independently of actions"
 
-If LGP were action-conditioned, its `z_g` would partly reflect the policy's
+If Latent Goal Expert were action-conditioned, its `z_g` would partly reflect the policy's
 own choices — the MPC scorer would then rank candidates against itself,
-conflating "what the policy will do" with "what it should do." Making LGP
+conflating "what the policy will do" with "what it should do." Making Latent Goal Expert
 read only `(language goal, scene, robot state, z_t)` keeps `z_g` fixed
 across the K action perturbations at inference and gives the scorer a
 clean, action-independent target.
@@ -349,7 +349,7 @@ clean, action-independent target.
 
 `src/lerobot/policies/sawseenvlawm/smolvlm_with_two_experts.py` —
 `SmolVLMWithTwoExpertsModel(SmolVLMWithExpertModel)`. Adds a second
-`lm_expert` (the LGP expert) with its own width / depth, and generalizes
+`lm_expert` (the Latent Goal Expert) with its own width / depth, and generalizes
 the cross-attn dispatch from one expert to N via
 `_forward_cross_attn_layer_n`. Falls back to the parent's single-expert
 path when called with `inputs_embeds` of length ≤ 2 (e.g., inference Mode
@@ -361,10 +361,10 @@ Per-expert weight counts at the SawSeenVLA defaults
 | Expert  | Hidden | Layers | Trainable params |
 |---------|-------:|-------:|-----------------:|
 | Action  |    720 |     16 |             ~98M |
-| LGP      |    720 |     16 |             ~98M |
+| Latent Goal Expert      |    720 |     16 |             ~98M |
 
 Doubling the trainable parameter count vs vanilla sawseenvlawm
-(when LGP is on) is a known cost.
+(when Latent Goal Expert is on) is a known cost.
 
 ### Config surface
 
@@ -373,26 +373,26 @@ existing `lewm_inject_to`:
 
 | Field | Default | Notes |
 |---|---|---|
-| `lgp_enabled` | `False` | Master switch. Off → bit-identical to vanilla sawseenvlawm. |
-| `lgp_loss_weight` | `1.0` | λ in `L = L_action + λ · L_fs`. |
-| `lgp_loss_type` | `"bc"` | Phase A only: flow-matching MSE. `"contrastive"` reserved for a later ablation. |
-| `lgp_num_steps` | `10` | Inference-time denoising steps for LGP (unused in Phase A). |
-| `lgp_expert_width_multiplier` | `0.75` | Mirrors the action expert default; keeps the two heads symmetric. |
-| `lgp_num_expert_layers` | `-1` | -1 = match VLM depth (same default as the action expert). |
-| `lewm_inject_to=`**`"none"`** | — | New value. Encoder is loaded but no tokens flow into the action expert. Used to isolate the LGP as the only le-wm pathway into the training signal. |
+| `latent_goal_enabled` | `False` | Master switch. Off → bit-identical to vanilla sawseenvlawm. |
+| `latent_goal_loss_weight` | `1.0` | λ in `L = L_action + λ · L_fs`. |
+| `latent_goal_loss_type` | `"bc"` | Phase A only: flow-matching MSE. `"contrastive"` reserved for a later ablation. |
+| `latent_goal_num_steps` | `10` | Inference-time denoising steps for Latent Goal Expert (unused in Phase A). |
+| `latent_goal_expert_width_multiplier` | `0.75` | Mirrors the action expert default; keeps the two heads symmetric. |
+| `latent_goal_num_expert_layers` | `-1` | -1 = match VLM depth (same default as the action expert). |
+| `lewm_inject_to=`**`"none"`** | — | New value. Encoder is loaded but no tokens flow into the action expert. Used to isolate the Latent Goal Expert as the only le-wm pathway into the training signal. |
 
 `observation_delta_indices` is now a property: returns `[0, chunk_size]`
-when LGP is enabled (so the dataset delivers both the anchor and chunk-end
+when Latent Goal Expert is enabled (so the dataset delivers both the anchor and chunk-end
 frames per sample), `[0]` otherwise.
 
 ### Code touchpoints
 
 | Path | Status | Purpose |
 |---|---|---|
-| `src/lerobot/policies/sawseenvlawm/smolvlm_with_two_experts.py` | new | `SmolVLMWithTwoExpertsModel`. Adds `lgp_expert` + multi-stream cross-attn dispatch. |
-| `src/lerobot/policies/sawseenvlawm/configuration_sawseenvlawm.py` | edit | Six new fields; `observation_delta_indices` returns `[0, chunk_size]` when LGP is on; `lewm_inject_to="none"` allowed. |
-| `src/lerobot/policies/sawseenvlawm/modeling_sawseenvlawm.py` | edit | Picks `SmolVLMWithTwoExpertsModel` over `SmolVLMWithExpertModel` when LGP is on. New projections (`lgp_in_proj`, `lgp_anchor_proj`, `lgp_time_mlp_*`, `lgp_out_proj`). New methods `embed_lgp_suffix`, `_encode_lewm_cls`, `prepare_chunk_end_images`. LGP branch in `VLAFlowMatching.forward()` returns `(action_losses, lgp_loss)`. Outer policy `forward()` combines them and surfaces `loss_action` / `loss_lgp` in `loss_dict`. |
-| `sawseenvlawm.mk` | edit | New `LGP`, `LGP_LOSS_WEIGHT` knobs; passes `--policy.lgp_enabled` and `--policy.lgp_loss_weight` to `lerobot-train`. |
+| `src/lerobot/policies/sawseenvlawm/smolvlm_with_two_experts.py` | new | `SmolVLMWithTwoExpertsModel`. Adds `latent_goal_expert` + multi-stream cross-attn dispatch. |
+| `src/lerobot/policies/sawseenvlawm/configuration_sawseenvlawm.py` | edit | Six new fields; `observation_delta_indices` returns `[0, chunk_size]` when Latent Goal Expert is on; `lewm_inject_to="none"` allowed. |
+| `src/lerobot/policies/sawseenvlawm/modeling_sawseenvlawm.py` | edit | Picks `SmolVLMWithTwoExpertsModel` over `SmolVLMWithExpertModel` when Latent Goal Expert is on. New projections (`latent_goal_in_proj`, `latent_goal_anchor_proj`, `latent_goal_time_mlp_*`, `latent_goal_out_proj`). New methods `embed_latent_goal_suffix`, `_encode_lewm_cls`, `prepare_chunk_end_images`. Latent Goal Expert branch in `VLAFlowMatching.forward()` returns `(action_losses, latent_goal_loss)`. Outer policy `forward()` combines them and surfaces `loss_action` / `loss_latent_goal` in `loss_dict`. |
+| `sawseenvlawm.mk` | edit | New `LATENT_GOAL`, `LATENT_GOAL_LOSS_WEIGHT` knobs; passes `--policy.latent_goal_enabled` and `--policy.latent_goal_loss_weight` to `lerobot-train`. |
 
 ### Loss and logging
 
@@ -402,22 +402,22 @@ Three TB scalars surface every log step:
 | TB scalar | What it is |
 |---|---|
 | `train/loss_action` | Action expert flow-matching MSE alone |
-| `train/loss_lgp` | LGP flow-matching MSE alone |
+| `train/loss_latent_goal` | Latent Goal Expert flow-matching MSE alone |
 | `train/loss` | Combined optimizer loss |
 
 This works automatically because `loss_dict` is merged into the
 `output_dict` returned from `policy.forward()`, and the training loop
 already feeds `output_dict` into the TB logger.
 
-### What LGP is *not* doing yet (Phase A boundary)
+### What Latent Goal Expert is *not* doing yet (Phase A boundary)
 
 - **No inference path.** `sample_actions` calls the wrapper with
   `inputs_embeds=[prefix, action_suffix]` (length 2), which falls back to
-  the parent's single-expert path. LGP is silent at inference.
+  the parent's single-expert path. Latent Goal Expert is silent at inference.
 - **No MPC inner loop.** K-perturbation + WM rollout + argmin is Phase B.
 - **No le-wm JEPA predictor.** Only the encoder is loaded — the
   forward-dynamics predictor lands in Phase B.
-- **No contrastive loss.** `lgp_loss_type="bc"` is the only
+- **No contrastive loss.** `latent_goal_loss_type="bc"` is the only
   path; flow-matching MSE against the encoded chunk-end.
 - **No distillation.** Mode-3 in the synthesis doc is Phase D.
 
@@ -425,35 +425,369 @@ already feeds `output_dict` into the TB logger.
 
 | Run | Status | Result |
 |---|---|---|
-| 4-step smoke (bs=2, 1-token LGP suffix) | done | `loss_lgp` 2.41 → 1.96 → 1.88; gradients flow into both experts |
-| 4-step smoke (bs=2, 2-token LGP suffix + action-blind mask) | pending — GPU contention | architecture verified by import test; smoke pending GPU availability |
-| Long LGP-only ablation (`LGP=true LEWM_INJECT_TO=none`) | pending | clean isolation of LGP's effect on action loss |
-| LGP retrieval probe at chunk-end checkpoint | pending | held-out cosine sim of LGP-decoded `z_g` vs actual encoded chunk-end frame should beat random other-episode chunk-end frames |
+| 4-step smoke (bs=2, 1-token Latent Goal Expert suffix) | done | `loss_latent_goal` 2.41 → 1.96 → 1.88; gradients flow into both experts |
+| 4-step smoke (bs=2, 2-token Latent Goal Expert suffix + action-blind mask) | pending — GPU contention | architecture verified by import test; smoke pending GPU availability |
+| Long Latent Goal Expert-only ablation (`Latent Goal Expert=true LEWM_INJECT_TO=none`) | pending | clean isolation of Latent Goal Expert's effect on action loss |
+| Latent Goal Expert retrieval probe at chunk-end checkpoint | pending | held-out cosine sim of Latent Goal Expert-decoded `z_g` vs actual encoded chunk-end frame should beat random other-episode chunk-end frames |
 
 ### Recommended ablation matrix
 
-| Run | LEWM_INJECT_TO | LGP | What it isolates |
+| Run | LEWM_INJECT_TO | Latent Goal Expert | What it isolates |
 |---|---|---|---|
 | Baseline (vanilla sawseenvla) | n/a | false | Vanilla reference |
 | Side-channel only (existing parked result) | suffix (k=1) | false | The parked ablation |
-| **LGP-only (target)** | **none** | **true** | **Pure LGP effect on action loss** |
-| LGP + side-channel | suffix (k=1) | true | Stacked uplift (if any) |
+| **Latent Goal Expert-only (target)** | **none** | **true** | **Pure Latent Goal Expert effect on action loss** |
+| Latent Goal Expert + side-channel | suffix (k=1) | true | Stacked uplift (if any) |
 
-The clean experiment is "LGP-only" vs "Baseline" — both have the same
+The clean experiment is "Latent Goal Expert-only" vs "Baseline" — both have the same
 information available to the action expert (prefix only, no le-wm
-side-channel), the only difference being whether LGP is trained as a
+side-channel), the only difference being whether Latent Goal Expert is trained as a
 joint auxiliary head.
 
 ### Run command
 
 ```bash
-# LGP-only Phase A ablation:
+# Latent Goal Expert-only Phase A ablation:
 make -f sawseenvlawm.mk train \
-  LGP=true LEWM_INJECT_TO=none \
+  LATENT_GOAL=true LEWM_INJECT_TO=none \
   STEPS=8000 BATCH_SIZE=64 \
-  OUTPUT_DIR=outputs/train/sawseenvlawm_libero_lgp_only_8k
+  OUTPUT_DIR=outputs/train/sawseenvlawm_libero_latent_goal_only_8k
 ```
 
-`BATCH_SIZE` may need to drop from 96 → 64 to fit the LGP expert's ~98M
+`BATCH_SIZE` may need to drop from 96 → 64 to fit the Latent Goal Expert's ~98M
 extra params on 24 GB cards. Watch `nvidia-smi` during the first 200
 steps and bump up if there's headroom.
+
+---
+
+## Mode 3 — Latent Goal Expert-conditioned action expert
+
+A third pathway: feed the LGE's predicted goal latent **directly into
+the action expert's suffix** as conditioning, instead of using it only
+as a Phase B MPC scoring target. The action expert's suffix is
+prepended with two tokens `[z_t, z_g]` (192-d le-wm latents projected
+to expert hidden), with cumulative attention `[1, 0]` so they form one
+bidirectional block before the causal action chunk.
+
+### Why this is a different bet
+
+- The parked side-channel ablation showed that adding *another visual
+  stream* to the action expert doesn't move action loss. Mode 3 is a
+  different hypothesis: not "more vision," but "give the action expert
+  a goal cue in le-wm geometry that the language prefix doesn't
+  already encode."
+- Re-uses the LGE head we already trained for Phase A. No new losses
+  or training schedule — just a new pathway through the suffix.
+- End-to-end differentiable (no MPC inner loop needed).
+
+### Architecture — 3-pass training, sequential by construction
+
+Because the action expert needs LGE's *output* as input, the two
+experts can no longer run in parallel through the shared backbone.
+Training switches to three sequential calls into
+`SmolVLMWithTwoExpertsModel`, all sharing one VLM K/V cache:
+
+```
+Pass 1: inputs_embeds=[prefix, None, None]   fill_kv_cache=True   → builds VLM K/V
+Pass 2: inputs_embeds=[None, None, lge]      fill_kv_cache=False  → emits v_lge → L_lge
+        z_g_pred = lge_x_t - t · v_lge     (clean prediction reconstructed via FM identity)
+Pass 3: inputs_embeds=[None, action+inject, None]  fill_kv_cache=False  → action loss
+        action_suffix = [proj(z_t), proj(z_g_pred).detach(), lewm?, action_chunk]
+```
+
+The cache is read-only after Pass 1 (`fill_kv_cache=False` in 2/3) so
+the action expert and LGE never see each other's K/V. The
+`.detach()` on `z_g` (and `z_t`) into the action expert is the
+KI-style barrier: action loss cannot reshape LGE weights through the
+conditioning path; LGE remains supervised purely by `L_lge`. Both
+losses still flow into the VLM via their independent cross-attentions.
+
+### Inference — K-step LGE denoise + K-step action denoise
+
+```
+1.  prefix forward → cache  (one VLM pass, identical to Phase A)
+2.  K-step LGE flow-matching denoising on top of the cache → clean z_g
+3.  K-step action denoising loop, with [z_t, z_g] tokens fixed across steps
+```
+
+The marginal cost on top of Phase A is `K · (LGE forward)`. With
+`latent_goal_num_steps=10` and the LGE expert at width 720 / 16 layers,
+this roughly matches the action expert's cost — wall-clock latency
+~2× Phase A.
+
+### Config surface (Mode 3)
+
+| Field | Default | Notes |
+|---|---|---|
+| `latent_goal_inject_to_action` | `False` | Master switch. Off → bit-identical to Phase A. |
+| `latent_goal_inject_z_g_source` | `"encoded"` | `"encoded"` = train on dataset's chunk-end CLS (clean target, but train≠eval since eval uses LGE's denoised output). `"predicted"` = train on LGE's reconstructed clean prediction `z_g_pred = x_t - t·v` (matches inference distribution; noisier early). |
+| `latent_goal_inject_detach` | `True` | Detach `z_g` (and `z_t`) before the action expert reads them. False makes the conditioning path differentiable so action loss also reshapes LGE — collapses goal latent toward "whatever helps the policy." |
+
+Requires `latent_goal_enabled=True` (validated in `__post_init__`).
+
+### Run command
+
+```bash
+# Mode 3 training: predicted z_g, paper-faithful detach, isolated LGE
+# (no le-wm side-channel into the action expert):
+make -f sawseenvlawm.mk train \
+  LATENT_GOAL=true LATENT_GOAL_INJECT_TO_ACTION=true \
+  LATENT_GOAL_INJECT_Z_G_SOURCE=predicted LATENT_GOAL_INJECT_DETACH=true \
+  LEWM_INJECT_TO=none \
+  STEPS=8000 BATCH_SIZE=64 \
+  OUTPUT_DIR=outputs/train/sawseenvlawm_libero_mode3_predicted_8k
+```
+
+### What can go wrong
+
+1. **Anchor token unused under pure cross-attn.** If
+   `self_attn_every_n_layers=-1` is forced, the LGE's anchor and
+   denoise tokens stop seeing each other (cross-attn-only means each
+   expert token reads only the VLM prefix, not its own siblings).
+   Mode 3 keeps the default mixed-attention regime, so LGE's
+   bidirectional anchor↔denoise still works in the self-attn-every-2
+   layers.
+2. **Train/eval z_g mismatch with `source="encoded"`.** Training sees
+   the dataset's exact chunk-end CLS; eval sees LGE's K-step denoised
+   output. If LGE is undertrained, eval z_g is off-distribution from
+   what the action expert learned to condition on.
+3. **`detach=False` collapses the goal.** Action loss gradient through
+   `z_g` reshapes LGE to output "whatever helps the policy," and the
+   chunk-end-target supervision can't compete. The Phase A
+   action-blindness rationale assumed detach (or no path at all); only
+   flip to `False` deliberately and watch `loss_lge` for collapse.
+
+## Phase B — MPC inference with le-wm predictor
+
+A runtime-only addition (no training change): rescore the action expert's
+output against the LGE goal using le-wm's forward dynamics. The policy
+already produces a clean *anchor* chunk; MPC samples perturbations
+around the anchor, rolls each through the le-wm predictor in latent
+space, and picks the candidate whose terminal latent is closest to the
+LGE-predicted goal.
+
+### Why now / what it gives us
+
+- All three required components are already on disk: encoder + projector
+  + action_encoder + predictor + pred_proj live in the same le-wm
+  `<name>_object.ckpt` we use for the encoder (the file is a pickled
+  `JEPA` module, not just a state-dict).
+- We already have a goal in LGE (`_latent_goal_denoise` returns a clean
+  `z_g`). MPC turns LGE from "extra training signal" into a runtime
+  filter on the policy's own samples.
+- No retraining, no new losses. Failure mode is graceful: if MPC scoring
+  is uncalibrated, candidate 0 = anchor wins, behavior equals current
+  policy.
+
+### Two schemes (both anchor-based)
+
+Both schemes perturb around the policy's clean anchor `a*`, NOT around
+random noise. The anchor is the action expert's deterministic
+flow-matching output (same code path as today). This gives MPC a strong
+prior — perturbations explore the policy's neighborhood, not the whole
+action space.
+
+```
+Scheme A (single-shot, recommended for v1):
+   a*       ← anchor from one full denoising of the action expert (B, T, A)
+   ε_k      ← N candidates of additive Gaussian noise, k=1..N-1
+   a_k      = a* + σ ⊙ ε_k       (candidate 0 = a* itself, σ from config)
+   ẑ_k      ← rollout(z_t, a_k) via le-wm predictor → (B, N, 192)
+   k*       = argmin_k ‖ẑ_k − z_g‖² in post-projector space
+   return a_{k*}
+
+Scheme B (CEM, comparison knob):
+   μ_0      ← a*    (anchor as initial mean)
+   σ_0      ← σ_init (config; per-dim or scalar)
+   for m in 1..M:
+       a_k  ← μ_{m-1} + σ_{m-1} ⊙ ε_k,  k=1..N
+       cost ← ‖rollout(z_t, a_k) − z_g‖²
+       top  ← top-K_elite candidates by cost
+       μ_m  = top.mean();  σ_m = top.std()   (optional EMA toward prior)
+   return arg-min cost from final iter
+```
+
+Scheme A is one CEM iter (M=1) with no Gaussian update. Implementation
+shares the same inner kernel:
+
+```
+def _mpc_score(z_t_emb, z_g_emb, candidates_actions):
+    """candidates_actions: (B*N, T, action_dim). Returns (B, N) cost."""
+    return rollout_and_compare(...)
+```
+
+### Anchor + perturbations (Scheme A) — step-by-step
+
+```
+1. Build VLM prefix once: prefix_embs, cache ← vlm_with_expert(prefix, fill_kv=True)
+2. z_t_cls  ← lewm_encoder(o_t).cls                                  (B, 192)
+3. z_g_cls  ← _latent_goal_denoise(z_t_cls, prefix_pad, cache)        (B, 192)
+4. Mode 3 inject_tokens = [proj_zt(z_t_cls), proj_zg(z_g_cls)]        (B, 2, H_act)
+5. ── anchor: standard flow-matching denoising (10 steps), single batch B
+       a* = sample_actions_core(...)   shape (B, T, A_raw_padded)
+       a*_raw = a*[:, :, :action_dim]    shape (B, T, A_raw)
+6. ── perturbations
+       ε     ~ N(0, I) shape (B, N-1, T, A_raw)
+       a_k   = a*_raw[:, None] + σ * ε  shape (B, N, T, A_raw)   (k=0 is a* itself)
+7. ── post-projector latents (scoring space)
+       z_t_emb = lewm_world.projector(z_t_cls)   (B, 192)
+       z_g_emb = lewm_world.projector(z_g_cls)   (B, 192)
+8. ── le-wm rollout, batch (B*N)
+       hist_emb = z_t_emb[:, None, :].expand(-1, HS=3, -1)            (B*N, 3, 192)
+       hist_act = a_k[:, :3, :]                                        (B*N, 3, A_raw)
+       for t in 0..T-2:
+            act_emb = lewm_world.action_encoder(hist_act[:, -3:])      (B*N, 3, 192)
+            pred    = lewm_world.predict(hist_emb[:, -3:], act_emb)[:, -1:]
+            hist_emb = cat([hist_emb, pred], dim=1)
+            hist_act = cat([hist_act, a_k[:, t+3:t+4, :]], dim=1)
+       ẑ = hist_emb[:, -1]                                              (B*N, 192)
+9. ── score and pick
+       cost = ((ẑ - z_g_emb_expanded)**2).sum(-1).view(B, N)
+       best = cost.argmin(dim=1)                                        (B,)
+       return torch.stack([a_k[b, best[b]] for b in range(B)])           (B, T, A_raw)
+```
+
+The key engineering moves:
+- **Anchor reuse**: the existing `sample_actions` body produces `a*`
+  with **no replication** (batch B), so VLM prefix and action denoising
+  stay at their current cost.
+- **Predictor rollout is cheap**: ARPredictor is depth-6 / 192-d. Even
+  at B*N=64, 9 rollout steps take << 1 action-expert step on the same
+  batch. The dominant marginal cost is the rollout, not the policy.
+- **History init**: we have one frame (`o_t`). le-wm trained with
+  history_size=3, so we repeat `z_t_emb` 3× to fill the context window.
+  This makes the predictor see `(z_t, z_t, z_t)` initially — the
+  "no-motion" prior. After 3 rollout steps the window is fully
+  predicted; the first 2 outputs are slightly OOD but discarded (we
+  only use the final emb).
+
+### CEM scheme (Scheme B) — what changes
+
+Same kernel, wrapped in a Gaussian-fit outer loop:
+
+```
+μ, σ = a*_raw, σ_init
+for m in range(num_iter):
+    a_k  = μ[:, None] + σ * randn(B, N, T, A_raw)
+    cost = _mpc_score(z_t_emb, z_g_emb, a_k)         # (B, N)
+    elite_idx = cost.topk(K_elite, dim=1, largest=False).indices
+    elite_a   = gather(a_k, elite_idx)                # (B, K_elite, T, A_raw)
+    μ = elite_a.mean(dim=1)
+    σ = elite_a.std(dim=1) * (1 - α) + σ_init * α     # optional anchoring
+return _mpc_score on final samples, pick argmin
+```
+
+For comparable wall clock, set `num_iter * N_per_iter ≈ N` of Scheme A
+(e.g. Scheme A: N=32; Scheme B: 4 iters × 8 candidates).
+
+### Config surface (Phase B / MPC)
+
+| Field | Default | Notes |
+|---|---|---|
+| `mpc_enabled` | `False` | Master switch. Off → `sample_actions` returns the anchor directly (current behavior). |
+| `mpc_scheme` | `"anchor_perturb"` | `"anchor_perturb"` (Scheme A, single-shot) or `"cem"` (Scheme B). |
+| `mpc_num_candidates` | `16` | N. Includes the anchor itself as candidate 0 in Scheme A. |
+| `mpc_noise_scale` | `0.1` | σ on perturbations. In normalized-action units; 0.1 ≈ 1/10 of action std. |
+| `mpc_score_space` | `"post_proj"` | `"post_proj"` (recommended) or `"cls"`. Post-proj is the predictor's supervision space; CLS matches LGE's training target but mismatches the predictor side. |
+| `mpc_cem_num_iter` | `4` | Scheme B only. Outer CEM iterations. |
+| `mpc_cem_topk` | `4` | Scheme B only. Elite set per iter. |
+| `mpc_cem_anchor_blend` | `0.5` | Scheme B only. σ-anchoring weight toward `σ_init` (1.0 = pure init, 0.0 = drift freely). |
+| `mpc_predictor_path` | inherits `lewm_encoder_path` | Path to the le-wm `<name>_object.ckpt`. Same pickle holds encoder + projector + predictor; we load the full module at policy construction when `mpc_enabled=True`. |
+
+The relevant validations in `__post_init__`:
+
+```python
+if self.mpc_enabled:
+    if not self.latent_goal_enabled:
+        raise ValueError("mpc_enabled=True requires latent_goal_enabled=True (z_g supplier)")
+    if not self.lewm_encoder_path and not self.mpc_predictor_path:
+        raise ValueError("mpc_enabled=True requires a le-wm checkpoint (lewm_encoder_path or mpc_predictor_path)")
+    if self.mpc_num_candidates < 2:
+        raise ValueError("mpc_num_candidates must be >= 2 (anchor + at least one perturbation)")
+    if self.mpc_scheme not in ("anchor_perturb", "cem"):
+        raise ValueError(...)
+    if self.mpc_score_space not in ("post_proj", "cls"):
+        raise ValueError(...)
+```
+
+### Code touchpoints
+
+1. **`lewm_encoder.py`** — add `LeWMWorldModel` class that wraps the
+   pickled `JEPA` (encoder + projector + action_encoder + predictor +
+   pred_proj). Expose `cls(images) → (B, 192)`,
+   `project(cls) → (B, 192)`, `predict_emb(emb, act_emb) → (B, T, 192)`.
+   Frozen by default. The existing `LeWMVisionEncoder` becomes a thin
+   wrapper around `LeWMWorldModel.encoder` when `mpc_enabled=False`, so
+   only one ViT lives in memory either way.
+
+2. **`modeling_sawseenvlawm.py`** — add:
+   - `self.lewm_world: LeWMWorldModel | None = None` constructed when
+     `mpc_enabled=True`.
+   - `mpc_sample_actions(images, img_masks, lang_tokens, lang_masks, state, ...)`
+     orchestrating the anchor → perturb → rollout → score → argmin
+     flow described above.
+   - Branch in `_get_action_chunk`:
+     `if self.config.mpc_enabled: actions = self.model.mpc_sample_actions(...)`
+     else fall through to `sample_actions` as today.
+   - `_lewm_rollout_score(...)` private helper, shared between Scheme A
+     and Scheme B.
+
+3. **`configuration_sawseenvlawm.py`** — add the fields above with the
+   validations.
+
+4. **`sawseenvlawm.mk`** — add the new MPC knobs as `?=`-overridable
+   variables; new eval target `eval-mpc` that flips `mpc_enabled=true`
+   for an existing trained checkpoint (no retraining).
+
+### Compute budget vs Phase A inference
+
+| Component | Phase A (current) | MPC v1 (Scheme A, N=16) |
+|---|---|---|
+| VLM prefix | 1× | 1× |
+| LGE denoise (K=10) | 10× LGE forward | 10× LGE forward |
+| Action denoise (10 steps) | 10× action forward, batch B | 10× action forward, batch B (anchor only) |
+| le-wm rollout | — | 9× ARPredictor forward, batch B·N |
+| le-wm encode (z_t) | already used for LGE anchor | reuse, no new cost |
+| Projector forwards | — | 2 forwards (z_t, z_g) total |
+
+ARPredictor is 5 orders of magnitude smaller than the action expert
+forward per token. Expected wall-clock overhead at N=16: **~10–20%**
+beyond Phase A. At N=64, **~30–50%**. Memory: O(N) on the rollout
+embeddings (192-d × T × N) only — negligible compared to action-expert
+activations.
+
+### Validation plan
+
+1. **Smoke test** (bs=2, N=4, num_iter=1) — verify shapes flow through
+   the new path, no NaN, output `(2, T, action_dim)`.
+2. **Calibration probe** — on 50 libero episodes: for each step, log
+   `(cost_anchor, cost_best_perturbation, anchor_chosen_share)`. If MPC
+   chooses anchor >90% of the time, σ is too small or LGE is too
+   uncertain to discriminate; if <10%, anchor is bad and we should
+   sanity-check the predictor calibration.
+3. **A/B vs Mode 3** — same checkpoint, eval Phase A vs MPC-Scheme-A vs
+   MPC-Scheme-B on libero_10. Pass criterion: at least one MPC variant
+   ≥ Phase A on overall success rate; full table of per-suite deltas.
+4. **σ sweep** — N=16, σ ∈ {0.05, 0.1, 0.2, 0.4}. Plot success vs σ.
+
+### Risks and open questions
+
+| Risk | Notes / mitigation |
+|---|---|
+| **Action-norm gap (accepted).** sawseenvlawm normalizes actions per LeRobotDataset; le-wm uses its own per-column StandardScaler. Magnitudes likely close on libero (both near zero-mean unit-var) but not identical. | v1 measures the gap empirically via the calibration probe. If `cost_anchor` drifts with action magnitude, add a renormalizer in v2. |
+| **LGE-target vs predictor-target space mismatch.** LGE was trained against pre-projector CLS; predictor outputs are post-projector. v1 fixes it by applying `projector` to LGE's z_g at inference. The projection is a learned MLP, so projecting an off-manifold prediction may amplify error. | Calibration probe will catch this. v2: retrain LGE with target = `projector(CLS)` (single-line change in `_encode_lewm_cls`). |
+| **History-init (z_t, z_t, z_t) is OOD for predictor.** Predictor trained on real 3-frame sequences, never on repeated frames. | First 2 rollout outputs are discarded (we score only the final emb), so the impact is bounded but non-zero. If costs are noisy, switch to history_size=1 or pad with a learned token. |
+| **Candidates collapse around anchor.** If σ is too small or the policy is over-confident, all candidates produce nearly the same `ẑ` and MPC is a no-op. | σ sweep in validation. Also: include a "stochastic flow" mode that re-runs partial denoising from a higher t to broaden the distribution (v2). |
+| **Anchor 'always wins'.** Calibration may favor the anchor's trajectory because the predictor sees in-distribution actions only for the anchor. Perturbations push actions slightly off-policy, which might *increase* predicted-state error without changing real-world outcome. | Use σ small enough that perturbations stay near the action manifold. The argmin-against-z_g objective should still favor genuinely-better candidates when they exist. |
+| **Throughput hit on libero eval (1024 envs).** N=16 expands the action-expert batch implicitly via rollout only, not via VLM/action-expert. Should be fine, but worth a libero throughput probe before launching a full eval. | Profile MPC at bs=8 and bs=32 before launching a 1024-env eval. |
+
+### v1 → v2 roadmap
+
+- v1 (this design): Scheme A + Scheme B selectable, anchor-based, post-proj scoring, accepted action-norm gap.
+- v2 candidates (only if v1 shows promise):
+  - Retrain LGE in post-projector space (eliminates the projection-of-LGE-output hack).
+  - Load le-wm action stats and re-normalize.
+  - Receding-horizon execute (re-plan every k<chunk_size steps).
+  - Stochastic flow for broader sampling (SDE flow / partial denoising).
+  - Multi-step LGE goal (predict z at multiple horizons, score with weighted MSE).
+

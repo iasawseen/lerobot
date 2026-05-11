@@ -375,10 +375,10 @@ class SawSeenVLAWMPolicy(PreTrainedPolicy):
 
         chunk_end_images = None
         chunk_end_pad_mask = None
-        if self.config.lgp_enabled:
+        if self.config.latent_goal_enabled:
             chunk_end_images, chunk_end_pad_mask = self.prepare_chunk_end_images(batch)
 
-        losses, lgp_loss = self.model.forward(
+        losses, latent_goal_loss = self.model.forward(
             images, img_masks, lang_tokens, lang_masks, state, actions, noise, time,
             chunk_end_images=chunk_end_images,
             chunk_end_pad_mask=chunk_end_pad_mask,
@@ -403,11 +403,11 @@ class SawSeenVLAWMPolicy(PreTrainedPolicy):
             else:
                 num_valid = ((~actions_is_pad).sum(dim=1) * losses.shape[-1]).clamp_min(1)
                 per_sample_loss = losses.sum(dim=(1, 2)) / num_valid
-            # LGP loss is a scalar; broadcast it to per-sample for the
+            # Latent Goal Expert loss is a scalar; broadcast it to per-sample for the
             # weighted-sum convention used by sample_weighter consumers.
-            if lgp_loss is not None:
-                per_sample_loss = per_sample_loss + self.config.lgp_loss_weight * lgp_loss
-                loss_dict["loss_lgp"] = lgp_loss.item()
+            if latent_goal_loss is not None:
+                per_sample_loss = per_sample_loss + self.config.latent_goal_loss_weight * latent_goal_loss
+                loss_dict["loss_latent_goal"] = latent_goal_loss.item()
             loss_dict["loss"] = per_sample_loss.mean().item()
             return per_sample_loss, loss_dict
         else:
@@ -418,9 +418,9 @@ class SawSeenVLAWMPolicy(PreTrainedPolicy):
                 num_valid = ((~actions_is_pad).sum() * losses.shape[-1]).clamp_min(1)
                 loss_action = losses.sum() / num_valid
             loss_dict["loss_action"] = loss_action.item()
-            if lgp_loss is not None:
-                loss = loss_action + self.config.lgp_loss_weight * lgp_loss
-                loss_dict["loss_lgp"] = lgp_loss.item()
+            if latent_goal_loss is not None:
+                loss = loss_action + self.config.latent_goal_loss_weight * latent_goal_loss
+                loss_dict["loss_latent_goal"] = latent_goal_loss.item()
             else:
                 loss = loss_action
             loss_dict["loss"] = loss.item()
@@ -440,11 +440,11 @@ class SawSeenVLAWMPolicy(PreTrainedPolicy):
                 f"All image features are missing from the batch. At least one expected. (batch: {batch.keys()}) (image_features:{self.config.image_features})"
             )
         # Preprocess image features present in the batch.
-        # When ``observation_delta_indices = [0, chunk_size]`` (LGP
+        # When ``observation_delta_indices = [0, chunk_size]`` (Latent Goal Expert
         # enabled) the obs stack is shape (B, 2, C, H, W) with index 0 the
         # anchor frame and index 1 the chunk-end frame. We always take the
         # anchor at index 0 here; ``prepare_chunk_end_images`` reads index 1
-        # separately for the LGP regression target.
+        # separately for the Latent Goal Expert regression target.
         for key in present_img_keys:
             img = batch[key][:, 0, :, :, :] if batch[key].ndim == 5 else batch[key]
             if self.config.resize_imgs_with_padding is not None:
@@ -501,27 +501,27 @@ class SawSeenVLAWMPolicy(PreTrainedPolicy):
         return actions
 
     def prepare_chunk_end_images(self, batch):
-        """Extract and preprocess the chunk-end frame for LGP.
+        """Extract and preprocess the chunk-end frame for Latent Goal Expert.
 
         Mirrors ``prepare_images`` but reads index 1 (the o_{t+chunk_size}
         frame) and additionally returns a per-sample boolean mask marking
         samples whose chunk-end fell past the episode boundary (so the
-        dataset returned padded frames). The LGP loss masks those out.
+        dataset returned padded frames). The Latent Goal Expert loss masks those out.
 
         Returns ``(images, chunk_end_pad_mask)`` where ``chunk_end_pad_mask``
-        has shape ``(B,)`` and is True for samples to drop from the LGP loss.
+        has shape ``(B,)`` and is True for samples to drop from the Latent Goal Expert loss.
         """
         images = []
         per_camera_pads = []
         present_img_keys = [key for key in self.config.image_features if key in batch]
         if len(present_img_keys) == 0:
             raise ValueError(
-                "No image features in the batch — cannot extract chunk-end frame for LGP."
+                "No image features in the batch — cannot extract chunk-end frame for Latent Goal Expert."
             )
         for key in present_img_keys:
             if batch[key].ndim != 5 or batch[key].shape[1] < 2:
                 raise ValueError(
-                    f"LGP expects observation stack shape (B, 2, C, H, W) for "
+                    f"Latent Goal Expert expects observation stack shape (B, 2, C, H, W) for "
                     f"{key}, got {tuple(batch[key].shape)}. Confirm "
                     f"observation_delta_indices=[0, chunk_size]."
                 )
@@ -542,7 +542,7 @@ class SawSeenVLAWMPolicy(PreTrainedPolicy):
         return images, chunk_end_pad_mask
 
     def prepare_state(self, batch):
-        """Pad state. Index 0 is the anchor frame; LGP-mode chunk-end state
+        """Pad state. Index 0 is the anchor frame; Latent Goal Expert-mode chunk-end state
         at index 1 is intentionally discarded — it's the *outcome* of the
         actions and isn't an input."""
         state = batch[OBS_STATE][:, 0, :] if batch[OBS_STATE].ndim > 2 else batch[OBS_STATE]
@@ -555,25 +555,71 @@ class SawSeenVLAWMPolicy(PreTrainedPolicy):
         return actions
 
     def _get_default_peft_targets(self) -> dict[str, any]:
-        """Return default PEFT target modules for SawSeenVLAWM fine-tuning."""
-        common_projections = (
-            "state_proj|action_in_proj|action_out_proj|action_time_mlp_in|action_time_mlp_out"
-        )
-        target_modules = rf"(model\.vlm_with_expert\.lm_expert\..*\.(q|v)_proj|model\.({common_projections}))"
+        """LoRA adapters on the frozen SmolVLM2 text_model q/v_proj only.
+
+        The action expert and (when enabled) the Latent Goal Expert are
+        randomly initialized — LoRA-wrapping them would freeze random
+        weights. They go to ``modules_to_save`` instead, alongside the
+        small projections (state, action in/out, time MLP, le-wm,
+        Latent Goal Expert, Mode 3 inject). Vision encoder is left out
+        of LoRA targeting so its activations aren't retained during
+        backward (same blow-up sawseenvla hit at bs=64).
+
+        Gradients from both experts still reach the LoRA adapters: the
+        wrapper stores prefix K/V in ``past_key_values`` without
+        ``.detach()``, so each expert's cross-attention into the cache
+        is autograd-connected back to ``vlm.text_model.*.{q,v}_proj``
+        and through them into the LoRA A/B matrices.
+        """
+        target_modules = r"model\.vlm_with_expert\.vlm\.model\.text_model\..*\.self_attn\.(q|v)_proj"
+
+        modules_to_save = [
+            "lm_expert",
+            "state_proj",
+            "action_in_proj",
+            "action_out_proj",
+            "action_time_mlp_in",
+            "action_time_mlp_out",
+        ]
+        cfg = self.config
+        if cfg.lewm_encoder_path is not None and cfg.lewm_inject_to == "suffix":
+            modules_to_save.append("lewm_proj")
+        if cfg.latent_goal_enabled:
+            modules_to_save += [
+                "latent_goal_expert",
+                "latent_goal_in_proj",
+                "latent_goal_out_proj",
+                "latent_goal_time_mlp_in",
+                "latent_goal_time_mlp_out",
+                "latent_goal_anchor_proj",
+            ]
+        if cfg.latent_goal_inject_to_action:
+            modules_to_save += [
+                "latent_goal_action_zt_proj",
+                "latent_goal_action_zg_proj",
+            ]
         return {
             "target_modules": target_modules,
-            "modules_to_save": [],
+            "modules_to_save": modules_to_save,
         }
 
     def _validate_peft_config(self, peft_config) -> None:
-        """Validate PEFT configuration for SawSeenVLAWM."""
-        super()._validate_peft_config(peft_config)
-        if not self.config.load_vlm_weights:
-            import logging
+        """Validate PEFT configuration for SawSeenVLAWM.
 
-            logging.warning(
-                "Training SawSeenVLAWM from scratch using PEFT. This is unlikely to yield good results. "
-                "Set `load_vlm_weights=True` to fine-tune the existing policy."
+        Skips the base-class ``pretrained_path`` requirement: for
+        SawSeenVLAWM the LoRA targets the **VLM** (which is loaded via
+        ``load_vlm_weights=True`` from the HF Hub, not from a
+        SawSeenVLAWM checkpoint). Either a SawSeenVLAWM pretrained_path
+        OR load_vlm_weights=True is enough to make PEFT meaningful.
+        """
+        if not self.config.pretrained_path and not self.config.load_vlm_weights:
+            raise ValueError(
+                "PEFT is enabled but neither pretrained_path nor "
+                "load_vlm_weights is set. LoRA targets the frozen pretrained "
+                "VLM; with random VLM init there is nothing useful to adapt. "
+                "Set load_vlm_weights=True (to fine-tune from the HF VLM "
+                "checkpoint) or supply --policy.path=<sawseenvlawm_ckpt> (to "
+                "adapt an existing SawSeenVLAWM checkpoint), or disable PEFT."
             )
 
 
@@ -627,8 +673,8 @@ class VLAFlowMatching(nn.Module):
         super().__init__()
         self.config = config
 
-        # When LGP is enabled, the wrapper holds a second flow-matching
-        # expert (lgp_expert) parallel to the action expert. Both experts share
+        # When Latent Goal Expert is enabled, the wrapper holds a second flow-matching
+        # expert (latent_goal_expert) parallel to the action expert. Both experts share
         # only the VLM backbone — separate weights, separate projections, same
         # per-layer interleaving as today's single-expert path.
         wrapper_kwargs = dict(
@@ -643,11 +689,11 @@ class VLAFlowMatching(nn.Module):
             expert_width_multiplier=self.config.expert_width_multiplier,
             device=self.config.device if self.config.device is not None else "auto",
         )
-        if self.config.lgp_enabled:
+        if self.config.latent_goal_enabled:
             self.vlm_with_expert = SmolVLMWithTwoExpertsModel(
                 **wrapper_kwargs,
-                lgp_expert_width_multiplier=self.config.lgp_expert_width_multiplier,
-                lgp_num_expert_layers=self.config.lgp_num_expert_layers,
+                latent_goal_expert_width_multiplier=self.config.latent_goal_expert_width_multiplier,
+                latent_goal_num_expert_layers=self.config.latent_goal_num_expert_layers,
             )
         else:
             self.vlm_with_expert = SmolVLMWithExpertModel(**wrapper_kwargs)
@@ -664,38 +710,49 @@ class VLAFlowMatching(nn.Module):
             self.vlm_with_expert.expert_hidden_size, self.vlm_with_expert.expert_hidden_size
         )
 
-        # LGP projections — only built when the flag is on. The LGP
+        # Latent Goal Expert projections — only built when the flag is on. The Latent Goal Expert
         # expert emits a 192-dim velocity (le-wm latent dim), so its in/out
-        # projections sit between 192 and the LGP expert's hidden size.
-        # ``lgp_anchor_proj`` projects the *current* le-wm state z_t into the
-        # LGP expert's input space; it sits next to the denoising token in the
-        # LGP suffix so the expert sees both "where am I now" and "noisy
+        # projections sit between 192 and the Latent Goal Expert's hidden size.
+        # ``latent_goal_anchor_proj`` projects the *current* le-wm state z_t into the
+        # Latent Goal Expert's input space; it sits next to the denoising token in the
+        # Latent Goal Expert suffix so the expert sees both "where am I now" and "noisy
         # future to denoise." Phase A keeps both at single-token granularity
-        # (CLS-only); ``lewm_num_tokens`` doesn't widen the LGP anchor here.
-        self.lgp_in_proj: nn.Linear | None = None
-        self.lgp_out_proj: nn.Linear | None = None
-        self.lgp_time_mlp_in: nn.Linear | None = None
-        self.lgp_time_mlp_out: nn.Linear | None = None
-        self.lgp_anchor_proj: nn.Linear | None = None
-        if self.config.lgp_enabled:
-            lgp_hidden = self.vlm_with_expert.lgp_expert_hidden_size
+        # (CLS-only); ``lewm_num_tokens`` doesn't widen the Latent Goal Expert anchor here.
+        self.latent_goal_in_proj: nn.Linear | None = None
+        self.latent_goal_out_proj: nn.Linear | None = None
+        self.latent_goal_time_mlp_in: nn.Linear | None = None
+        self.latent_goal_time_mlp_out: nn.Linear | None = None
+        self.latent_goal_anchor_proj: nn.Linear | None = None
+        # Mode 3 projections: route z_t (current le-wm CLS) and z_g (Latent Goal Expert
+        # predicted or encoded chunk-end CLS) into the action expert's
+        # suffix hidden space as two prepended tokens. Built only when the
+        # flag is on; left as None otherwise so the absence of the
+        # parameters is the test for "do we inject."
+        self.latent_goal_action_zt_proj: nn.Linear | None = None
+        self.latent_goal_action_zg_proj: nn.Linear | None = None
+        if self.config.latent_goal_enabled:
+            latent_goal_hidden = self.vlm_with_expert.latent_goal_expert_hidden_size
             # le-wm encoder output dim is 192 (ViT-Tiny). Hard-coded here
             # because the encoder isn't loaded yet at projection-init time
-            # when ``lewm_encoder_path`` is None — but LGP always
+            # when ``lewm_encoder_path`` is None — but Latent Goal Expert always
             # targets le-wm space regardless of whether action-expert
             # injection is on.
-            lgp_latent_dim = 192
-            self.lgp_in_proj = nn.Linear(lgp_latent_dim, lgp_hidden)
-            self.lgp_out_proj = nn.Linear(lgp_hidden, lgp_latent_dim)
-            self.lgp_time_mlp_in = nn.Linear(lgp_hidden * 2, lgp_hidden)
-            self.lgp_time_mlp_out = nn.Linear(lgp_hidden, lgp_hidden)
-            self.lgp_anchor_proj = nn.Linear(lgp_latent_dim, lgp_hidden)
+            latent_goal_latent_dim = 192
+            self.latent_goal_in_proj = nn.Linear(latent_goal_latent_dim, latent_goal_hidden)
+            self.latent_goal_out_proj = nn.Linear(latent_goal_hidden, latent_goal_latent_dim)
+            self.latent_goal_time_mlp_in = nn.Linear(latent_goal_hidden * 2, latent_goal_hidden)
+            self.latent_goal_time_mlp_out = nn.Linear(latent_goal_hidden, latent_goal_hidden)
+            self.latent_goal_anchor_proj = nn.Linear(latent_goal_latent_dim, latent_goal_hidden)
+            if self.config.latent_goal_inject_to_action:
+                action_hidden = self.vlm_with_expert.expert_hidden_size
+                self.latent_goal_action_zt_proj = nn.Linear(latent_goal_latent_dim, action_hidden)
+                self.latent_goal_action_zg_proj = nn.Linear(latent_goal_latent_dim, action_hidden)
 
         # le-wm visual side-channel (frozen ViT-Tiny trained on Libero).
         # When ``lewm_encoder_path`` is set, le-wm tokens are prepended to
         # the action expert's suffix (``lewm_inject_to="suffix"``). The
         # alternative value ``"none"`` loads the encoder but skips
-        # action-expert injection — used by LGP to consume the
+        # action-expert injection — used by Latent Goal Expert to consume the
         # encoder's raw 192-dim features without contaminating the action
         # stream.
         self.lewm_encoder: LeWMVisionEncoder | None = None
@@ -721,10 +778,10 @@ class VLAFlowMatching(nn.Module):
                 proj_out = self.vlm_with_expert.expert_hidden_size
                 self.lewm_proj = nn.Linear(self.lewm_encoder.output_dim, proj_out)
 
-        if self.config.lgp_enabled and self.lewm_encoder is None:
+        if self.config.latent_goal_enabled and self.lewm_encoder is None:
             raise ValueError(
-                "lgp_enabled=True requires lewm_encoder_path to be set — "
-                "LGP regresses against the le-wm encoded chunk-end frame, "
+                "latent_goal_enabled=True requires lewm_encoder_path to be set — "
+                "Latent Goal Expert regresses against the le-wm encoded chunk-end frame, "
                 "which is only available when the encoder is loaded."
             )
 
@@ -896,9 +953,22 @@ class VLAFlowMatching(nn.Module):
         tokens = self.lewm_encoder(stacked)  # (B, num_tokens, 192)
         return self.lewm_proj(tokens.to(self.lewm_proj.weight.dtype))
 
-    def embed_suffix(self, noisy_actions, timestep, lewm_tokens: torch.Tensor | None = None):
-        """Embed noisy_actions and timestep (plus optional le-wm tokens) for
-        the action expert.
+    def embed_suffix(
+        self,
+        noisy_actions,
+        timestep,
+        lewm_tokens: torch.Tensor | None = None,
+        latent_goal_inject_tokens: torch.Tensor | None = None,
+    ):
+        """Embed noisy_actions and timestep (plus optional le-wm and Latent Goal Expert
+        injection tokens) for the action expert.
+
+        ``latent_goal_inject_tokens`` (Mode 3) is a (B, 2, expert_hidden) tensor of
+        already-projected [z_t, z_g] tokens. It sits at the very front of
+        the suffix with ``att_mask=[1, 0]`` (one bidirectional block of two
+        tokens), before any optional ``lewm_tokens`` and the causal action
+        chunk. Cumsum ordering: action tokens see [z_t, z_g, lewm, prior
+        actions]; z_t / z_g themselves see only the prefix.
 
         ``lewm_tokens`` is prepended so the (causal) action tokens can each
         attend to all le-wm tokens. The le-wm block itself uses
@@ -914,6 +984,17 @@ class VLAFlowMatching(nn.Module):
         device = action_emb.device
         bsize = action_emb.shape[0]
         dtype = action_emb.dtype
+
+        # Optional Mode 3 Latent Goal Expert injection tokens — at the very front so they
+        # are conditioning, not conditioned. Bidirectional within their
+        # 2-token block.
+        if latent_goal_inject_tokens is not None:
+            latent_goal_inject_tokens = latent_goal_inject_tokens.to(dtype=dtype)
+            embs.append(latent_goal_inject_tokens)
+            num_inject = latent_goal_inject_tokens.shape[1]
+            inject_mask = torch.ones(bsize, num_inject, dtype=torch.bool, device=device)
+            pad_masks.append(inject_mask)
+            att_masks += [1] + [0] * (num_inject - 1)
 
         # Optional le-wm tokens — prepended.
         if lewm_tokens is not None:
@@ -956,27 +1037,27 @@ class VLAFlowMatching(nn.Module):
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
         return embs, pad_masks, att_masks
 
-    def embed_lgp_suffix(
+    def embed_latent_goal_suffix(
         self,
         anchor_z: torch.Tensor,
         noisy_z: torch.Tensor,
         timestep: torch.Tensor,
     ):
-        """Build the LGP expert's 2-token suffix.
+        """Build the Latent Goal Expert's 2-token suffix.
 
         Tokens (in this order):
           0. ``anchor_z_t`` — frozen le-wm encoding of the *current* frame,
-             projected into LGP expert space. Acts as the same-space anchor
-             the LGP expert conditions on (matches Phase B's WM rollout
+             projected into Latent Goal Expert space. Acts as the same-space anchor
+             the Latent Goal Expert conditions on (matches Phase B's WM rollout
              starting point).
           1. ``noisy_z_g + time`` — the denoising token; flow-matching
-             velocity is read from this position at the LGP expert's output.
+             velocity is read from this position at the Latent Goal Expert's output.
 
         Both tokens share one attention block (att_mask=[1, 0]) so they're
-        bidirectional within the LGP suffix. The block sits after the action
+        bidirectional within the Latent Goal Expert suffix. The block sits after the action
         tokens in the global cumulative-mask scheme, so action tokens cannot
-        see LGP. The reverse direction (LGP → action / LGP → suffix-lewm) is
-        blocked by an additional 2D-mask edit in ``forward()`` so that LGP
+        see Latent Goal Expert. The reverse direction (Latent Goal Expert → action / Latent Goal Expert → suffix-lewm) is
+        blocked by an additional 2D-mask edit in ``forward()`` so that Latent Goal Expert
         predicts the chunk-end state purely from (prefix, z_t anchor),
         independent of the action chunk being committed.
         """
@@ -985,20 +1066,20 @@ class VLAFlowMatching(nn.Module):
         if noisy_z.dim() == 2:
             noisy_z = noisy_z.unsqueeze(1)
 
-        # Anchor token: deterministic projection of z_t into LGP hidden.
-        anchor_emb = self.lgp_anchor_proj(
-            anchor_z.to(self.lgp_anchor_proj.weight.dtype)
-        )  # (B, 1, lgp_hidden)
+        # Anchor token: deterministic projection of z_t into Latent Goal Expert hidden.
+        anchor_emb = self.latent_goal_anchor_proj(
+            anchor_z.to(self.latent_goal_anchor_proj.weight.dtype)
+        )  # (B, 1, latent_goal_hidden)
 
         # Denoising token: fuse noisy z with sin-cos time embedding.
-        z_emb = self.lgp_in_proj(noisy_z.to(self.lgp_in_proj.weight.dtype))
+        z_emb = self.latent_goal_in_proj(noisy_z.to(self.latent_goal_in_proj.weight.dtype))
         bsize = z_emb.shape[0]
         device = z_emb.device
         dtype = z_emb.dtype
 
         time_emb = create_sinusoidal_pos_embedding(
             timestep,
-            self.vlm_with_expert.lgp_expert_hidden_size,
+            self.vlm_with_expert.latent_goal_expert_hidden_size,
             self.config.min_period,
             self.config.max_period,
             device=device,
@@ -1006,17 +1087,17 @@ class VLAFlowMatching(nn.Module):
         time_emb = time_emb[:, None, :].expand_as(z_emb)
 
         z_time_emb = torch.cat([z_emb, time_emb], dim=2)
-        z_time_emb = self.lgp_time_mlp_in(z_time_emb)
+        z_time_emb = self.latent_goal_time_mlp_in(z_time_emb)
         z_time_emb = F.silu(z_time_emb)
-        z_time_emb = self.lgp_time_mlp_out(z_time_emb)
+        z_time_emb = self.latent_goal_time_mlp_out(z_time_emb)
 
-        # Concat anchor + denoising token into a 2-token LGP suffix.
+        # Concat anchor + denoising token into a 2-token Latent Goal Expert suffix.
         anchor_emb = anchor_emb.to(dtype=z_time_emb.dtype)
-        embs = torch.cat([anchor_emb, z_time_emb], dim=1)  # (B, 2, lgp_hidden)
+        embs = torch.cat([anchor_emb, z_time_emb], dim=1)  # (B, 2, latent_goal_hidden)
 
         pad_mask = torch.ones(bsize, 2, dtype=torch.bool, device=device)
         # att_mask=[1, 0]: anchor opens a new attention block, denoising
-        # token shares it (same cumsum → bidirectional within LGP).
+        # token shares it (same cumsum → bidirectional within Latent Goal Expert).
         att_mask = torch.tensor([1.0, 0.0], dtype=z_time_emb.dtype, device=device)
         att_mask = att_mask[None, :].expand(bsize, 2)
         return embs, pad_mask, att_mask
@@ -1025,10 +1106,10 @@ class VLAFlowMatching(nn.Module):
         """Encode camera-concatenated images via the frozen le-wm encoder
         and return the CLS token (B, 192).
 
-        Used for both the LGP anchor (current frame) and the LGP regression
+        Used for both the Latent Goal Expert anchor (current frame) and the Latent Goal Expert regression
         target (chunk-end frame). Same camera-concat / 224×448 prep that
         the side-channel encoder uses; gradients are blocked because the
-        encoder is frozen and we only train the LGP head.
+        encoder is frozen and we only train the Latent Goal Expert head.
         """
         if len(images) == 1:
             stacked = images[0]
@@ -1057,77 +1138,214 @@ class VLAFlowMatching(nn.Module):
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks, state=state
         )
-        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, time, suffix_lewm)
 
-        # LGP twin-pass — when enabled, build a 2-token suffix for
-        # the LGP expert (anchor z_t + noisy z_g+time) and run both experts
-        # through the shared VLM in one forward.
-        lgp_loss: torch.Tensor | None = None
-        if self.config.lgp_enabled:
+        latent_goal_loss: torch.Tensor | None = None
+        prefix_len = prefix_pad_masks.shape[1]
+
+        if self.config.latent_goal_enabled and self.config.latent_goal_inject_to_action:
+            # ─────────────────────────── Mode 3 ───────────────────────────
+            # Sequential 3-pass forward: the action expert reads LGE's
+            # output (predicted z_g) as an extra suffix token, so the two
+            # experts can no longer run in parallel through the shared
+            # backbone. Pass 1 fills the VLM K/V cache once (prefix only);
+            # Pass 2 runs the LGE reading that cache and emits its
+            # velocity for the LGE flow-matching loss; Pass 3 runs the
+            # action expert reading the same cache, with [z_t, z_g]
+            # prepended to its suffix. Cache is read-only in Passes 2/3
+            # (``fill_kv_cache=False``) so action-expert and LGE never see
+            # each other's K/V.
             if chunk_end_images is None:
                 raise ValueError(
-                    "lgp_enabled=True requires chunk_end_images in forward(); "
-                    "the policy wrapper must extract the o_{t+chunk_size} frame from "
-                    "the batch when observation_delta_indices=[0, chunk_size]."
+                    "latent_goal_inject_to_action=True requires chunk_end_images in "
+                    "forward(); observation_delta_indices=[0, chunk_size] should be set."
                 )
-            # LGPlives entirely in le-wm space: anchor on z_t (current frame
-            # encoded by le-wm) and regress toward z_{t+chunk_size}.
             z_t_anchor = self._encode_lewm_cls(images)              # (B, 192)
             z_g_target = self._encode_lewm_cls(chunk_end_images)    # (B, 192)
 
-            lgp_noise = self.sample_noise(z_g_target.shape, z_g_target.device)
-            lgp_time = self.sample_time(z_g_target.shape[0], z_g_target.device)
-            lgp_t_exp = lgp_time[:, None]
-            lgp_x_t = lgp_t_exp * lgp_noise + (1 - lgp_t_exp) * z_g_target
-            lgp_u_t = lgp_noise - z_g_target
-
-            lgp_embs, lgp_pad_masks, lgp_att_masks = self.embed_lgp_suffix(
-                z_t_anchor, lgp_x_t, lgp_time
+            # ── Pass 1: prefix-only forward → VLM K/V cache ──
+            prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+            prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+            _, past_key_values = self.vlm_with_expert.forward(
+                attention_mask=prefix_att_2d_masks,
+                position_ids=prefix_position_ids,
+                past_key_values=None,
+                inputs_embeds=[prefix_embs, None, None],
+                use_cache=True,
+                fill_kv_cache=True,
             )
 
-            pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks, lgp_pad_masks], dim=1)
-            att_masks = torch.cat([prefix_att_masks, suffix_att_masks, lgp_att_masks], dim=1)
+            # ── Pass 2: LGE forward → flow-matching velocity & loss ──
+            latent_goal_noise = self.sample_noise(z_g_target.shape, z_g_target.device)
+            latent_goal_time = self.sample_time(z_g_target.shape[0], z_g_target.device)
+            latent_goal_t_exp = latent_goal_time[:, None]
+            latent_goal_x_t = (
+                latent_goal_t_exp * latent_goal_noise + (1 - latent_goal_t_exp) * z_g_target
+            )
+            latent_goal_u_t = latent_goal_noise - z_g_target
+
+            latent_goal_embs, latent_goal_pad_masks, latent_goal_att_masks = (
+                self.embed_latent_goal_suffix(z_t_anchor, latent_goal_x_t, latent_goal_time)
+            )
+            pass2_pad = torch.cat([prefix_pad_masks, latent_goal_pad_masks], dim=1)
+            pass2_att = torch.cat([prefix_att_masks, latent_goal_att_masks], dim=1)
+            pass2_2d = make_att_2d_masks(pass2_pad, pass2_att)
+            latent_goal_attention_mask = pass2_2d[:, prefix_len:, :]
+            pass2_position_ids_full = torch.cumsum(pass2_pad, dim=1) - 1
+            latent_goal_position_ids = pass2_position_ids_full[:, prefix_len:]
+
+            outputs2, _ = self.vlm_with_expert.forward(
+                attention_mask=latent_goal_attention_mask,
+                position_ids=latent_goal_position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=[None, None, latent_goal_embs],
+                use_cache=self.config.use_cache,
+                fill_kv_cache=False,
+            )
+            latent_goal_out = outputs2[2]
+            latent_goal_v = self.latent_goal_out_proj(
+                latent_goal_out[:, -1, :].to(dtype=torch.float32)
+            )
+            per_sample_fs = F.mse_loss(
+                latent_goal_u_t, latent_goal_v, reduction="none"
+            ).mean(dim=-1)
+            if chunk_end_pad_mask is not None:
+                valid = (~chunk_end_pad_mask).to(dtype=per_sample_fs.dtype)
+                denom = valid.sum().clamp_min(1.0)
+                latent_goal_loss = (per_sample_fs * valid).sum() / denom
+            else:
+                latent_goal_loss = per_sample_fs.mean()
+
+            # ── Build z_g for the action expert ──
+            if self.config.latent_goal_inject_z_g_source == "encoded":
+                z_g_for_action = z_g_target
+            elif self.config.latent_goal_train_num_steps > 1:
+                # K-step iterative denoise — matches the inference loop
+                # exactly so the action expert sees the same z_g
+                # distribution at train and eval. Runs under no_grad
+                # because z_g is detached on the action-expert side; the
+                # LGE flow-matching signal still comes from the Pass 2
+                # single-t forward above (latent_goal_v).
+                with torch.no_grad():
+                    z_g_for_action = self._latent_goal_denoise(
+                        z_t_anchor, prefix_pad_masks, past_key_values
+                    )
+            else:
+                # One-step closed-form reconstruction.
+                # Flow matching: x_t = t·noise + (1-t)·z_g  and  v = noise − z_g
+                #   ⇒  z_g_pred = x_t − t · v
+                z_g_for_action = (
+                    latent_goal_x_t.to(dtype=torch.float32)
+                    - latent_goal_t_exp.to(dtype=torch.float32) * latent_goal_v
+                )
+
+            z_t_for_action = z_t_anchor
+            if self.config.latent_goal_inject_detach:
+                z_t_for_action = z_t_for_action.detach()
+                z_g_for_action = z_g_for_action.detach()
+
+            zt_emb = self.latent_goal_action_zt_proj(
+                z_t_for_action.to(self.latent_goal_action_zt_proj.weight.dtype)
+            )
+            zg_emb = self.latent_goal_action_zg_proj(
+                z_g_for_action.to(self.latent_goal_action_zg_proj.weight.dtype)
+            )
+            latent_goal_inject = torch.stack([zt_emb, zg_emb], dim=1)  # (B, 2, hidden)
+
+            # ── Pass 3: action expert forward with z_t/z_g prepended ──
+            suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(
+                x_t, time, suffix_lewm, latent_goal_inject_tokens=latent_goal_inject
+            )
+            pass3_pad = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+            pass3_att = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
+            pass3_2d = make_att_2d_masks(pass3_pad, pass3_att)
+            action_attention_mask = pass3_2d[:, prefix_len:, :]
+            pass3_position_ids_full = torch.cumsum(pass3_pad, dim=1) - 1
+            action_position_ids = pass3_position_ids_full[:, prefix_len:]
+
+            outputs3, _ = self.vlm_with_expert.forward(
+                attention_mask=action_attention_mask,
+                position_ids=action_position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=[None, suffix_embs, None],
+                use_cache=self.config.use_cache,
+                fill_kv_cache=False,
+            )
+            action_suffix_out = outputs3[1][:, -self.config.chunk_size :].to(dtype=torch.float32)
+            v_t = self.action_out_proj(action_suffix_out)
+            losses = F.mse_loss(u_t, v_t, reduction="none")
+
+        elif self.config.latent_goal_enabled:
+            # ─────────────── Phase A: parallel single forward ───────────────
+            # Twin-pass — build a 2-token suffix for the Latent Goal Expert
+            # (anchor z_t + noisy z_g+time) and run both experts through the
+            # shared VLM in one forward.
+            if chunk_end_images is None:
+                raise ValueError(
+                    "latent_goal_enabled=True requires chunk_end_images in forward(); "
+                    "the policy wrapper must extract the o_{t+chunk_size} frame from "
+                    "the batch when observation_delta_indices=[0, chunk_size]."
+                )
+            suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(
+                x_t, time, suffix_lewm
+            )
+            z_t_anchor = self._encode_lewm_cls(images)              # (B, 192)
+            z_g_target = self._encode_lewm_cls(chunk_end_images)    # (B, 192)
+
+            latent_goal_noise = self.sample_noise(z_g_target.shape, z_g_target.device)
+            latent_goal_time = self.sample_time(z_g_target.shape[0], z_g_target.device)
+            latent_goal_t_exp = latent_goal_time[:, None]
+            latent_goal_x_t = (
+                latent_goal_t_exp * latent_goal_noise + (1 - latent_goal_t_exp) * z_g_target
+            )
+            latent_goal_u_t = latent_goal_noise - z_g_target
+
+            latent_goal_embs, latent_goal_pad_masks, latent_goal_att_masks = (
+                self.embed_latent_goal_suffix(z_t_anchor, latent_goal_x_t, latent_goal_time)
+            )
+
+            pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks, latent_goal_pad_masks], dim=1)
+            att_masks = torch.cat([prefix_att_masks, suffix_att_masks, latent_goal_att_masks], dim=1)
             att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
-            # Block LGP → suffix attention. The cumulative-mask scheme would
-            # otherwise let LGPtokens read from action (and suffix-lewm)
-            # tokens since their cumsum sits above the suffix. We want LGP
+            # Block Latent Goal Expert → suffix attention. The cumulative-mask scheme would
+            # otherwise let Latent Goal Expert tokens read from action (and suffix-lewm)
+            # tokens since their cumsum sits above the suffix. We want Latent Goal Expert
             # to predict z_g from (prefix, language goal, z_t anchor) only —
-            # independent of the action chunk being committed. Action → LGP
-            # is already blocked by the cumsum ordering (LGP comes later).
-            prefix_len = prefix_pad_masks.shape[1]
+            # independent of the action chunk being committed. Action → Latent Goal Expert
+            # is already blocked by the cumsum ordering (Latent Goal Expert comes later).
             suffix_len = suffix_pad_masks.shape[1]
-            lgp_start = prefix_len + suffix_len
-            att_2d_masks[:, lgp_start:, prefix_len:lgp_start] = False
+            latent_goal_start = prefix_len + suffix_len
+            att_2d_masks[:, latent_goal_start:, prefix_len:latent_goal_start] = False
             position_ids = torch.cumsum(pad_masks, dim=1) - 1
 
-            (_, suffix_out, lgp_out), _ = self.vlm_with_expert.forward(
+            (_, suffix_out, latent_goal_out), _ = self.vlm_with_expert.forward(
                 attention_mask=att_2d_masks,
                 position_ids=position_ids,
                 past_key_values=None,
-                inputs_embeds=[prefix_embs, suffix_embs, lgp_embs],
+                inputs_embeds=[prefix_embs, suffix_embs, latent_goal_embs],
                 use_cache=False,
                 fill_kv_cache=False,
             )
-            # Action loss as before (last chunk_size tokens of action suffix).
             action_suffix_out = suffix_out[:, -self.config.chunk_size :].to(dtype=torch.float32)
             v_t = self.action_out_proj(action_suffix_out)
             losses = F.mse_loss(u_t, v_t, reduction="none")
 
-            # LGP loss: read velocity from the *denoising* token (last
-            # position of the 2-token LGP suffix). The anchor token at
-            # position 0 has no flow-matching role; we discard its output.
-            lgp_v = self.lgp_out_proj(lgp_out[:, -1, :].to(dtype=torch.float32))  # (B, 192)
-            per_sample_fs = F.mse_loss(lgp_u_t, lgp_v, reduction="none").mean(dim=-1)  # (B,)
+            latent_goal_v = self.latent_goal_out_proj(
+                latent_goal_out[:, -1, :].to(dtype=torch.float32)
+            )
+            per_sample_fs = F.mse_loss(
+                latent_goal_u_t, latent_goal_v, reduction="none"
+            ).mean(dim=-1)
             if chunk_end_pad_mask is not None:
-                # ``chunk_end_pad_mask=True`` marks samples where the chunk-
-                # end frame fell past the episode boundary and was padded.
-                # Mask those out to avoid training LGPon stale padding.
                 valid = (~chunk_end_pad_mask).to(dtype=per_sample_fs.dtype)
                 denom = valid.sum().clamp_min(1.0)
-                lgp_loss = (per_sample_fs * valid).sum() / denom
+                latent_goal_loss = (per_sample_fs * valid).sum() / denom
             else:
-                lgp_loss = per_sample_fs.mean()
+                latent_goal_loss = per_sample_fs.mean()
+
         else:
+            suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(
+                x_t, time, suffix_lewm
+            )
             pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
             att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
 
@@ -1145,7 +1363,7 @@ class VLAFlowMatching(nn.Module):
             suffix_out = suffix_out.to(dtype=torch.float32)
             v_t = self.action_out_proj(suffix_out)
             losses = F.mse_loss(u_t, v_t, reduction="none")
-        return losses, lgp_loss
+        return losses, latent_goal_loss
 
     def sample_actions(
         self,
@@ -1174,15 +1392,40 @@ class VLAFlowMatching(nn.Module):
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
-        # Compute image and language key value cache
+        # Compute image and language key value cache. In Mode 3 we go
+        # through the n-stream path so both experts can read the cache;
+        # use a length-3 ``inputs_embeds`` to switch the wrapper away from
+        # the parent's single-expert fallback.
+        mode3 = (
+            self.config.latent_goal_enabled and self.config.latent_goal_inject_to_action
+        )
+        prefix_inputs = [prefix_embs, None, None] if mode3 else [prefix_embs, None]
         _, past_key_values = self.vlm_with_expert.forward(
             attention_mask=prefix_att_2d_masks,
             position_ids=prefix_position_ids,
             past_key_values=None,
-            inputs_embeds=[prefix_embs, None],
+            inputs_embeds=prefix_inputs,
             use_cache=self.config.use_cache,
             fill_kv_cache=True,
         )
+
+        # Mode 3: produce a clean z_g once via K-step LGE denoising on top
+        # of the cached VLM prefix, then prepend [z_t, z_g] as fixed tokens
+        # to every action denoising step.
+        latent_goal_inject_tokens: torch.Tensor | None = None
+        if mode3:
+            z_t_anchor = self._encode_lewm_cls(images)
+            z_g_clean = self._latent_goal_denoise(
+                z_t_anchor, prefix_pad_masks, past_key_values
+            )
+            zt_emb = self.latent_goal_action_zt_proj(
+                z_t_anchor.to(self.latent_goal_action_zt_proj.weight.dtype)
+            )
+            zg_emb = self.latent_goal_action_zg_proj(
+                z_g_clean.to(self.latent_goal_action_zg_proj.weight.dtype)
+            )
+            latent_goal_inject_tokens = torch.stack([zt_emb, zg_emb], dim=1)
+
         num_steps = self.config.num_steps
         dt = -1.0 / num_steps
 
@@ -1198,6 +1441,7 @@ class VLAFlowMatching(nn.Module):
                     past_key_values=past_key_values,
                     timestep=current_timestep,
                     lewm_tokens=suffix_lewm_tokens,
+                    latent_goal_inject_tokens=latent_goal_inject_tokens,
                 )
 
             if self._rtc_enabled():
@@ -1230,10 +1474,18 @@ class VLAFlowMatching(nn.Module):
         x_t,
         timestep,
         lewm_tokens: torch.Tensor | None = None,
+        latent_goal_inject_tokens: torch.Tensor | None = None,
     ):
-        """Apply one denoising step of the noise `x_t` at a given timestep."""
+        """Apply one denoising step of the noise `x_t` at a given timestep.
+
+        ``latent_goal_inject_tokens`` (Mode 3 only) is a (B, 2, hidden)
+        tensor of pre-projected [z_t, z_g] tokens; static across denoising
+        steps. When provided, the wrapper is invoked through the n-stream
+        path so the latent_goal_expert column is silenced (None) while the
+        action expert reads the cached VLM K/V.
+        """
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(
-            x_t, timestep, lewm_tokens
+            x_t, timestep, lewm_tokens, latent_goal_inject_tokens=latent_goal_inject_tokens
         )
 
         suffix_len = suffix_pad_masks.shape[1]
@@ -1247,11 +1499,16 @@ class VLAFlowMatching(nn.Module):
         prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
         position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
 
+        action_inputs_embeds = (
+            [None, suffix_embs, None]
+            if (self.config.latent_goal_enabled and self.config.latent_goal_inject_to_action)
+            else [None, suffix_embs]
+        )
         outputs_embeds, _ = self.vlm_with_expert.forward(
             attention_mask=full_att_2d_masks,
             position_ids=position_ids,
             past_key_values=past_key_values,
-            inputs_embeds=[None, suffix_embs],
+            inputs_embeds=action_inputs_embeds,
             use_cache=self.config.use_cache,
             fill_kv_cache=False,
         )
@@ -1260,3 +1517,65 @@ class VLAFlowMatching(nn.Module):
         suffix_out = suffix_out.to(dtype=torch.float32)
         v_t = self.action_out_proj(suffix_out)
         return v_t
+
+    def _latent_goal_denoise(
+        self,
+        z_t_anchor: torch.Tensor,
+        prefix_pad_masks: torch.Tensor,
+        past_key_values,
+    ) -> torch.Tensor:
+        """K-step flow-matching denoising of the LGE goal latent at inference.
+
+        Produces a clean ``z_g`` (B, 192) by initializing from Gaussian
+        noise at t=1 and integrating the LGE velocity field down to t=0
+        with ``num_steps=config.latent_goal_num_steps``. Reuses the
+        prefix VLM K/V cache that was built before action denoising
+        starts, so the only marginal cost vs Phase A is the LGE expert
+        forwards (one per denoising step).
+        """
+        bsize = z_t_anchor.shape[0]
+        device = z_t_anchor.device
+        latent_dim = z_t_anchor.shape[-1]
+        z = self.sample_noise((bsize, latent_dim), device)
+        num_steps = self.config.latent_goal_num_steps
+        dt = -1.0 / num_steps
+        for step in range(num_steps):
+            t_scalar = 1.0 + step * dt
+            t = torch.tensor(t_scalar, dtype=torch.float32, device=device).expand(bsize)
+            v = self._latent_goal_denoise_step(z_t_anchor, z, t, prefix_pad_masks, past_key_values)
+            z = z + dt * v
+        return z
+
+    def _latent_goal_denoise_step(
+        self,
+        z_t_anchor: torch.Tensor,
+        noisy_z: torch.Tensor,
+        timestep: torch.Tensor,
+        prefix_pad_masks: torch.Tensor,
+        past_key_values,
+    ) -> torch.Tensor:
+        """One LGE denoising step. Mirrors the action ``denoise_step`` plumbing
+        for the LGE suffix; emits the velocity at the denoising token
+        position."""
+        latent_goal_embs, latent_goal_pad_masks, latent_goal_att_masks = (
+            self.embed_latent_goal_suffix(z_t_anchor, noisy_z, timestep)
+        )
+        suffix_len = latent_goal_pad_masks.shape[1]
+        batch_size = prefix_pad_masks.shape[0]
+        prefix_len = prefix_pad_masks.shape[1]
+        prefix_pad_2d = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
+        suffix_att_2d = make_att_2d_masks(latent_goal_pad_masks, latent_goal_att_masks)
+        full_att_2d = torch.cat([prefix_pad_2d, suffix_att_2d], dim=2)
+        prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
+        position_ids = prefix_offsets + torch.cumsum(latent_goal_pad_masks, dim=1) - 1
+
+        outputs, _ = self.vlm_with_expert.forward(
+            attention_mask=full_att_2d,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=[None, None, latent_goal_embs],
+            use_cache=self.config.use_cache,
+            fill_kv_cache=False,
+        )
+        latent_goal_out = outputs[2]
+        return self.latent_goal_out_proj(latent_goal_out[:, -1, :].to(dtype=torch.float32))

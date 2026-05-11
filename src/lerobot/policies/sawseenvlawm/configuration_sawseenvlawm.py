@@ -134,7 +134,7 @@ class SawSeenVLAWMConfig(PreTrainedConfig):
     #     only le-wm pathway into the training signal.
     lewm_inject_to: str = "suffix"
 
-    # Latent Goal Predictor (LGP) — implementation of the "Future Sight"
+    # Latent Goal Expert — implementation of the "Future Sight"
     # expert from design/future-sight-implicit-wm.md (Phase A — single-latent
     # implicit world modeling). When enabled, a second flow-matching expert
     # sits next to the action expert on the shared VLM backbone
@@ -143,23 +143,59 @@ class SawSeenVLAWMConfig(PreTrainedConfig):
     # observation — i.e. the observation that would follow the last action
     # of the chunk the action expert just emitted. Off by default;
     # structurally a no-op when False.
-    lgp_enabled: bool = False
-    # Loss weight λ in ``L = L_action + λ · L_lgp``.
-    lgp_loss_weight: float = 1.0
-    # Training signal for the LGP. ``"bc"`` = flow-matching MSE against the
+    latent_goal_enabled: bool = False
+    # Loss weight λ in ``L = L_action + λ · L_latent_goal``.
+    latent_goal_loss_weight: float = 1.0
+    # Training signal for the Latent Goal Expert. ``"bc"`` = flow-matching MSE against the
     # encoded chunk-end frame. ``"contrastive"`` is reserved for a later
     # ablation (InfoNCE on goal-text vs. chunk-end-latent pairs).
-    lgp_loss_type: str = "bc"
-    # Flow-matching denoising steps for the LGP at inference (unused in
-    # Phase A — there is no LGP inference path yet).
-    lgp_num_steps: int = 10
-    # LGP expert width relative to VLM hidden_size (mirrors
+    latent_goal_loss_type: str = "bc"
+    # Flow-matching denoising steps for the Latent Goal Expert at inference (unused in
+    # Phase A — there is no Latent Goal Expert inference path yet).
+    latent_goal_num_steps: int = 10
+    # Latent Goal Expert width relative to VLM hidden_size (mirrors
     # ``expert_width_multiplier`` for the action expert). 0.75 keeps it the
     # same width as the action expert so they're symmetric heads.
-    lgp_expert_width_multiplier: float = 0.75
-    # Number of LGP expert layers. -1 = match VLM depth (same default as
+    latent_goal_expert_width_multiplier: float = 0.75
+    # Number of Latent Goal Expert layers. -1 = match VLM depth (same default as
     # the action expert via ``num_expert_layers``).
-    lgp_num_expert_layers: int = -1
+    latent_goal_num_expert_layers: int = -1
+
+    # ── Mode 3: Latent Goal Expert-conditioned action expert ──────────────────────
+    # When True, the action expert's suffix is prepended with two tokens
+    # [z_t, z_g] in le-wm space (projected to expert hidden). z_t is the
+    # le-wm CLS of the current frame; z_g is either the encoded chunk-end
+    # frame (source="encoded", training only) or Latent Goal Expert's predicted clean
+    # latent reconstructed from its velocity (source="predicted", matches
+    # inference). Training switches to a sequential 3-pass forward
+    # (prefix → Latent Goal Expert → action) so the action expert can read Latent Goal Expert's output;
+    # inference adds K Latent Goal Expert denoising steps before the action denoising
+    # loop.
+    latent_goal_inject_to_action: bool = False
+    # Source of z_g going into the action expert during training:
+    #   "encoded"  — frozen le-wm CLS of the dataset's chunk-end frame.
+    #                Train-only; falls back to "predicted" at inference.
+    #   "predicted" — Latent Goal Expert's clean prediction reconstructed from its
+    #                velocity at the sampled flow-matching timestep
+    #                (z_g_pred = latent_goal_x_t - t · v_latent_goal). Matches inference.
+    latent_goal_inject_z_g_source: str = "encoded"
+    # Detach z_g (and z_t) before they enter the action expert. True is
+    # the paper-faithful KI-style barrier — action loss cannot reshape
+    # Latent Goal Expert weights through the conditioning path. False makes the
+    # conditioning path differentiable so Latent Goal Expert also learns from action
+    # loss (collapses goal latent toward "whatever helps the policy").
+    latent_goal_inject_detach: bool = True
+    # Number of LGE denoising steps used when reconstructing z_g for the
+    # action expert during training (Mode 3, source="predicted"). 1
+    # (default) = closed-form one-step reconstruction (z_g = x_t − t·v at
+    # the single sampled t from the LGE training forward). K =
+    # ``latent_goal_num_steps`` matches the eval inference loop — same
+    # train/eval z_g distribution at the cost of K extra LGE forwards per
+    # training step (~2–2.5× per-step wall time). The K extra forwards
+    # run under ``torch.no_grad()``, so LGE training is unaffected: the
+    # flow-matching loss still comes from the separate single-t LGE
+    # forward. Ignored when source="encoded" or inject_to_action=False.
+    latent_goal_train_num_steps: int = 1
 
     def __post_init__(self):
         super().__post_init__()
@@ -173,6 +209,22 @@ class SawSeenVLAWMConfig(PreTrainedConfig):
         if self.use_delta_joint_actions_aloha:
             raise NotImplementedError(
                 "`use_delta_joint_actions_aloha` is used by sawseenvlawm for aloha real models. It is not ported yet in LeRobot."
+            )
+        if self.latent_goal_inject_to_action and not self.latent_goal_enabled:
+            raise ValueError(
+                "latent_goal_inject_to_action=True requires latent_goal_enabled=True — the "
+                "action expert reads Latent Goal Expert-predicted z_g, so the Latent Goal Expert head must "
+                "exist."
+            )
+        if self.latent_goal_inject_z_g_source not in ("encoded", "predicted"):
+            raise ValueError(
+                f"latent_goal_inject_z_g_source must be 'encoded' or 'predicted'; "
+                f"got {self.latent_goal_inject_z_g_source!r}"
+            )
+        if self.latent_goal_train_num_steps < 1:
+            raise ValueError(
+                "latent_goal_train_num_steps must be ≥ 1; got "
+                f"{self.latent_goal_train_num_steps}"
             )
 
     def validate_features(self) -> None:
@@ -203,11 +255,11 @@ class SawSeenVLAWMConfig(PreTrainedConfig):
 
     @property
     def observation_delta_indices(self) -> list:
-        # When the LGP is enabled, also fetch the frame at ``chunk_size``
-        # offset from the anchor — that's the LGP regression target. The
+        # When the Latent Goal Expert is enabled, also fetch the frame at ``chunk_size``
+        # offset from the anchor — that's the Latent Goal Expert regression target. The
         # dataset returns it alongside the anchor frame, padded if it falls
-        # past the episode end (the LGP loss masks padded samples).
-        if self.lgp_enabled:
+        # past the episode end (the Latent Goal Expert loss masks padded samples).
+        if self.latent_goal_enabled:
             return [0, self.chunk_size]
         return [0]
 

@@ -13,9 +13,9 @@ covers: [implicit-world-modeling, le-world-model, pi0.7, smolvla]
 > **Note on naming.** "Future Sight Expert" is the architectural name used
 > in this synthesis. The lerobot implementation in
 > [`design/SawSeenVLAWM.md`](./SawSeenVLAWM.md) calls the same head the
-> **Latent Goal Predictor (LGP)** — same component, more functional name.
+> **Latent Goal Expert** — same component, more functional name.
 > "Future Sight" refers to the broader *concept* (single-latent
-> implicit-WM stack); LGP refers to the specific *head* in code.
+> implicit-WM stack); Latent Goal Expert refers to the specific *head* in code.
 
 A sister architecture to the [VLM-Async Implicit WM](./vlm-async-implicit-wm.md) synthesis. Same goal — fill the [implicit-WM contract](../entities/implicit-world-modeling.md) at deployment. Same MPC scaffolding — K trajectory candidates, WM rollout, scoring, argmin. Different bet on **how the language pathway plugs into the WM's latent space**: instead of bridging two spaces with a learned Cost transformer, predict the target latent directly with a goal-conditioned generator ("Future Sight"). The result is a *single*-latent stack — encoder, WM, target predictor, and scorer all live in one space.
 

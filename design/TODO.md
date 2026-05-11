@@ -12,7 +12,7 @@ unless explicitly noted; each can land as its own PR.
   2× RTX 3090: ~100.7M trainable, 15.5 / 24 GB per GPU, ~1.27 s/step.
 - **sawseenvlawm:** scoped, not yet wired (regex still scoped to
   experts; needs the same `text_model`-only target as sawseenvla, plus
-  `lgp_*` and `lewm_proj` in `modules_to_save`).
+  `latent_goal_*` and `lewm_proj` in `modules_to_save`).
 
 The VLM (SmolVLM2-500M, with the SawSeenVLA default truncation to
 **16 text decoder layers**, hidden=960) is otherwise fully frozen.
@@ -84,17 +84,17 @@ adapters.
 ### sawseenvlawm scaffolding (still pending)
 
 Apply the shipped target regex + extend `modules_to_save` with the
-LGP-specific projections:
+Latent Goal Expert-specific projections:
 
 ```python
 target_modules = r"model\.vlm_with_expert\.vlm\.model\.text_model\..*\.self_attn\.(q|v)_proj"
 modules_to_save = [
-    "lm_expert", "lgp_expert",
+    "lm_expert", "latent_goal_expert",
     "state_proj",
     "action_in_proj", "action_out_proj",
     "action_time_mlp_in", "action_time_mlp_out",
-    "lgp_in_proj", "lgp_out_proj", "lgp_anchor_proj",
-    "lgp_time_mlp_in", "lgp_time_mlp_out",
+    "latent_goal_in_proj", "latent_goal_out_proj", "latent_goal_anchor_proj",
+    "latent_goal_time_mlp_in", "latent_goal_time_mlp_out",
     "lewm_proj",
 ]
 ```
@@ -156,15 +156,15 @@ scheme. Bringing it to sawseenvlawm with LoRA is new territory.
    replace `prefix_embs` with `prefix_embs.detach()` before passing to
    `embed_suffix` / the action expert path. The flow-matching loss
    propagates through the experts but stops at the VLM boundary —
-   neither the action gradient nor the LGP gradient affects the VLM
+   neither the action gradient nor the Latent Goal Expert gradient affects the VLM
    LoRA adapters.
 6. **Loss combination:**
-   `L = L_action(detached prefix) + λ_lgp · L_lgp(detached prefix) + λ_ki · L_ki(prefix gradients → VLM LoRA)`
+   `L = L_action(detached prefix) + λ_latent_goal · L_latent_goal(detached prefix) + λ_ki · L_ki(prefix gradients → VLM LoRA)`
 
 **Memory budget on 2× 3090:**
 - VLM LoRA adapters at r=16: ~0.5M trainable params, ~8 MB Adam state.
 - FAST lm_head (192-class? 1024-class?) on hidden=960: ~1M params.
-- Action expert + LGP expert + projections: ~196M (unchanged).
+- Action expert + Latent Goal Expert + projections: ~196M (unchanged).
 - **Total trainable: ~197M** vs. the ~696M of "full VLM + experts."
   Roughly the same as the current full-FT-experts setup, so should fit
   at the same bs=64 we're already using. KI doesn't blow up the budget.
@@ -197,10 +197,10 @@ scaffolding.
 ## 3. VLAWM hybrid (Phase B of Future Sight)
 
 **Status:** designed in `design/future-sight-implicit-wm.md`, Phase A
-(LGP head training) is implemented and in active testing. Phase B is
+(Latent Goal Expert head training) is implemented and in active testing. Phase B is
 the inference-time MPC inner loop and is not implemented.
 
-The full hybrid is: at inference, the LGP gives `z_g` (the goal latent),
+The full hybrid is: at inference, the Latent Goal Expert gives `z_g` (the goal latent),
 the action expert gives an anchor chunk `a*`, the **le-wm JEPA predictor**
 rolls forward `chunk_size` steps from `z_t` for K perturbations of `a*`,
 and the perturbation that minimizes `d(WM(z_t, a*_k), z_g)` is what
@@ -214,8 +214,8 @@ synthesis doc (lines ~31–82).
    currently extracts only `.encoder`. Add `LeWMPredictor` (or extend
    the encoder wrapper) to expose `.predictor` and a forward that takes
    `(z_t, action_chunk) → ẑ_{t+H}`.
-2. **Wire inference-time LGP denoising.** Currently `sample_actions`
-   falls back to the parent's single-expert path (LGP silent). Add a
+2. **Wire inference-time Latent Goal Expert denoising.** Currently `sample_actions`
+   falls back to the parent's single-expert path (Latent Goal Expert silent). Add a
    parallel path that runs FS denoising (10 Euler steps) on the FS
    suffix to produce `z_g`. The same prefix KV cache the action expert
    uses can be reused.
@@ -233,7 +233,7 @@ synthesis doc (lines ~31–82).
    reloading the policy.
 
 **Validation pre-reqs:**
-- Phase A must show LGP retrieval-probe accuracy > random chance
+- Phase A must show Latent Goal Expert retrieval-probe accuracy > random chance
   (otherwise the MPC scorer is comparing against noise).
 - WM predictor needs verification it accepts arbitrary action chunks
   (training distribution matters; the doc's Step 0 failure-mining is
@@ -319,7 +319,7 @@ class InverseSqrtSchedulerConfig(LRSchedulerConfig):
 **Validation:** run two matched 8k-step sawseenvlawm jobs, one cosine
 one inverse-sqrt, same seed and effective batch. Compare:
 - Final action loss
-- LGP retrieval accuracy on a held-out slice
+- Latent Goal Expert retrieval accuracy on a held-out slice
 - Eval success rate on libero suites
 
 If inverse-sqrt is within noise of cosine, prefer it for the
@@ -341,7 +341,7 @@ test, plus the comparison run.
 ## Cross-references
 
 - [`design/SawSeenVLAWM.md`](./SawSeenVLAWM.md) — current
-  implementation: side-channel (parked) + LGP Phase A (active).
+  implementation: side-channel (parked) + Latent Goal Expert Phase A (active).
 - [`design/future-sight-implicit-wm.md`](./future-sight-implicit-wm.md) —
   synthesis: motivation, four-phase recipe, MPC scaffolding, ablation
   matrix.
@@ -355,7 +355,7 @@ test, plus the comparison run.
    the same scaffolding to sawseenvlawm next; it's the prerequisite for
    KI+FAST+LoRA below. Variant ablations (B/C, r=32) once the baseline
    has a clean training curve.
-3. **Phase B of VLAWM hybrid** — *after* Phase A LGP shows non-trivial
+3. **Phase B of VLAWM hybrid** — *after* Phase A Latent Goal Expert shows non-trivial
    retrieval accuracy. No point wiring MPC if the FS head isn't
    producing meaningful goal latents.
 4. **KI + FAST + LoRA** last — biggest scope, most novel. Builds on

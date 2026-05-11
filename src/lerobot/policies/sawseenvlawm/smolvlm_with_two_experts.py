@@ -7,11 +7,11 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 
 """Two-experts variant of SmolVLMWithExpertModel for the Latent Goal
-Predictor (LGP) — the implementation of the "Future Sight" expert from
+Expert — the implementation of the "Future Sight" expert from
 ``design/future-sight-implicit-wm.md``.
 
 The shared SmolVLM backbone runs once per forward pass; two flow-matching
-experts (action expert + LGP expert) live next to it as parallel
+experts (action expert + Latent Goal Expert) live next to it as parallel
 transformer stacks, layer-interleaved with the VLM exactly like the existing
 single-expert wrapper. Each expert has its own weights, depth, width, and
 projections — they share *only* the VLM.
@@ -39,44 +39,44 @@ from lerobot.policies.smolvla.smolvlm_with_expert import (
 
 
 class SmolVLMWithTwoExpertsModel(SmolVLMWithExpertModel):
-    """SmolVLM + two parallel flow-matching experts (action + LGP).
+    """SmolVLM + two parallel flow-matching experts (action + Latent Goal Expert).
 
     Streams during forward (when both experts are fed):
-        inputs_embeds = [prefix_embs, action_suffix_embs, lgp_suffix_embs]
-        model_layers  = [vlm_layers,  action_expert_layers, lgp_expert_layers]
+        inputs_embeds = [prefix_embs, action_suffix_embs, latent_goal_suffix_embs]
+        model_layers  = [vlm_layers,  action_expert_layers, latent_goal_expert_layers]
 
-    Either LGP embeddings can be ``None`` to skip that expert at inference
+    Either Latent Goal Expert embeddings can be ``None`` to skip that expert at inference
     (e.g. when only running the action expert in Mode 1).
     """
 
     def __init__(
         self,
         *args,
-        lgp_expert_width_multiplier: float = 0.75,
-        lgp_num_expert_layers: int = -1,
+        latent_goal_expert_width_multiplier: float = 0.75,
+        latent_goal_num_expert_layers: int = -1,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
 
-        # Build the second (LGP) expert from the original VLM text
-        # config, scaled by ``lgp_expert_width_multiplier`` — same recipe the
+        # Build the second (Latent Goal Expert) expert from the original VLM text
+        # config, scaled by ``latent_goal_expert_width_multiplier`` — same recipe the
         # parent uses for ``lm_expert`` (action), but with its own width and
         # depth knobs.
         original_hidden = self.vlm.config.text_config.hidden_size
-        lgp_config = copy.deepcopy(self.vlm.config.text_config)
-        lgp_hidden = int(original_hidden * lgp_expert_width_multiplier)
-        lgp_config.hidden_size = lgp_hidden
-        lgp_config.intermediate_size = get_intermediate_size(lgp_hidden)
-        lgp_config.num_hidden_layers = self.num_vlm_layers
-        if lgp_num_expert_layers > 0:
-            assert self.num_vlm_layers % lgp_num_expert_layers == 0, (
+        latent_goal_config = copy.deepcopy(self.vlm.config.text_config)
+        latent_goal_hidden = int(original_hidden * latent_goal_expert_width_multiplier)
+        latent_goal_config.hidden_size = latent_goal_hidden
+        latent_goal_config.intermediate_size = get_intermediate_size(latent_goal_hidden)
+        latent_goal_config.num_hidden_layers = self.num_vlm_layers
+        if latent_goal_num_expert_layers > 0:
+            assert self.num_vlm_layers % latent_goal_num_expert_layers == 0, (
                 f"num_vlm_layers ({self.num_vlm_layers}) must be a multiple of "
-                f"lgp_num_expert_layers ({lgp_num_expert_layers})"
+                f"latent_goal_num_expert_layers ({latent_goal_num_expert_layers})"
             )
-            lgp_config.num_hidden_layers = lgp_num_expert_layers
-        self.lgp_expert = AutoModel.from_config(lgp_config)
-        self.lgp_expert_hidden_size = lgp_config.hidden_size
-        self.num_lgp_expert_layers = len(self.lgp_expert.layers)
+            latent_goal_config.num_hidden_layers = latent_goal_num_expert_layers
+        self.latent_goal_expert = AutoModel.from_config(latent_goal_config)
+        self.latent_goal_expert_hidden_size = latent_goal_config.hidden_size
+        self.num_latent_goal_expert_layers = len(self.latent_goal_expert.layers)
 
         # Cross-attention re-projection: in cross-attn layers each expert's
         # k_proj/v_proj must accept VLM-hidden-sized inputs (since they read
@@ -84,42 +84,42 @@ class SmolVLMWithTwoExpertsModel(SmolVLMWithExpertModel):
         # parent applies to ``lm_expert``.
         if "cross" in self.attention_mode:
             vlm_text = self.vlm.config.text_config
-            for layer_idx in range(len(self.lgp_expert.layers)):
+            for layer_idx in range(len(self.latent_goal_expert.layers)):
                 if (
                     self.self_attn_every_n_layers > 0
                     and layer_idx % self.self_attn_every_n_layers == 0
                 ):
                     continue
-                self.lgp_expert.layers[layer_idx].self_attn.k_proj = nn.Linear(
+                self.latent_goal_expert.layers[layer_idx].self_attn.k_proj = nn.Linear(
                     vlm_text.num_key_value_heads * vlm_text.head_dim,
-                    lgp_config.num_key_value_heads * lgp_config.head_dim,
-                    bias=lgp_config.attention_bias,
+                    latent_goal_config.num_key_value_heads * latent_goal_config.head_dim,
+                    bias=latent_goal_config.attention_bias,
                 )
-                self.lgp_expert.layers[layer_idx].self_attn.v_proj = nn.Linear(
+                self.latent_goal_expert.layers[layer_idx].self_attn.v_proj = nn.Linear(
                     vlm_text.num_key_value_heads * vlm_text.head_dim,
-                    lgp_config.num_key_value_heads * lgp_config.head_dim,
-                    bias=lgp_config.attention_bias,
+                    latent_goal_config.num_key_value_heads * latent_goal_config.head_dim,
+                    bias=latent_goal_config.attention_bias,
                 )
 
-        self.lgp_expert.embed_tokens = None
+        self.latent_goal_expert.embed_tokens = None
 
         # Re-apply the requires_grad policy so the new expert's parameters
         # are configured the same way as ``lm_expert``.
-        self._set_lgp_expert_requires_grad()
+        self._set_latent_goal_expert_requires_grad()
 
-    def _set_lgp_expert_requires_grad(self):
+    def _set_latent_goal_expert_requires_grad(self):
         # Mirror the parent's behavior: lm_head is frozen on the expert
         # because we don't generate language tokens from it.
-        for name, params in self.lgp_expert.named_parameters():
+        for name, params in self.latent_goal_expert.named_parameters():
             if "lm_head" in name:
                 params.requires_grad = False
 
     def set_requires_grad(self):
         super().set_requires_grad()
-        # ``lgp_expert`` may not exist yet on the very first call from the
+        # ``latent_goal_expert`` may not exist yet on the very first call from the
         # parent's __init__ (it runs before our subclass init builds it).
-        if hasattr(self, "lgp_expert"):
-            self._set_lgp_expert_requires_grad()
+        if hasattr(self, "latent_goal_expert"):
+            self._set_latent_goal_expert_requires_grad()
 
     # ------------------------------------------------------------------
     # Layer dispatch
@@ -174,7 +174,7 @@ class SmolVLMWithTwoExpertsModel(SmolVLMWithExpertModel):
                 fill_kv_cache=fill_kv_cache,
             )
 
-        models = [self.get_vlm_model().text_model, self.lm_expert, self.lgp_expert]
+        models = [self.get_vlm_model().text_model, self.lm_expert, self.latent_goal_expert]
         model_layers = self.get_model_layers(models)
         for hidden_states in inputs_embeds:
             if hidden_states is None:

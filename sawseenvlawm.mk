@@ -30,14 +30,16 @@ GPU            ?=
 
 # Train
 DATASET_REPO   ?= HuggingFaceVLA/libero
-# OUTPUT_DIR     ?= outputs/train/sawseenvlawm_libero_10k_bs64_lewm1_lgp_2xGPUs_bf16
-OUTPUT_DIR     ?= outputs/train/sawseenvlawm_test
-JOB_NAME       ?= sawseenvlawm_libero_lgp
+# OUTPUT_DIR     ?= outputs/train/sawseenvlawm_libero_10k_bs64_lewm1_lg_expert_lg_encoded_2xGPUs_bf16
+OUTPUT_DIR     ?= outputs/train/sawseenvlawm_libero_10k_bs64_lewm1_lg_expert_lg_predicted_k10_2xGPUs_bf16
+# OUTPUT_DIR     ?= outputs/train/sawseenvlawm_libero_lora_r16_lewm1_lg_expert_lg_predicted_10k_bs64_2xGPUs_bf16
+# OUTPUT_DIR     ?= outputs/train/sawseenvlawm_test
+JOB_NAME       ?= sawseenvlawm_libero_latent_goal
 STEPS          ?= 10000
-# bs=64 per GPU on 24 GB cards with LGP=true: the LGP expert adds ~98M
+# bs=64 per GPU on 24 GB cards with LATENT_GOAL=true: the LATENT_GOAL expert adds ~98M
 # trainable params + ~2 extra tokens through the full VLM/expert stack on
 # top of the side-channel suffix. Drop bs further (32) if you also push
-# LEWM_NUM_TOKENS up. Without LGP the side-channel-only configuration
+# LEWM_NUM_TOKENS up. Without LATENT_GOAL the side-channel-only configuration
 # fits at bs=96 (21 GB at lewm_num_tokens=1, suffix length 50 + 1 = 51).
 BATCH_SIZE     ?= 64
 NUM_WORKERS    ?= 4
@@ -72,21 +74,56 @@ LEWM_IMAGE_W     ?= 448
 # Where lewm tokens enter the model:
 #   suffix → projected to expert_hidden_size, prepended to action expert
 #   none   → encoder loaded but not injected into the action expert; used for
-#            LGP-only ablations where the Latent Goal Predictor is the
+#            LATENT_GOAL-only ablations where the Latent Goal Expert is the
 #            sole le-wm pathway
 LEWM_INJECT_TO   ?= suffix
 
-# Latent Goal Predictor (LGP) — implementation of the "Future Sight" expert
+# Latent Goal Expert (LATENT_GOAL) — implementation of the "Future Sight" expert
 # from design/future-sight-implicit-wm.md (Phase A). Adds a second
 # flow-matching head next to the action expert that regresses to the
 # encoded chunk-end frame z_{t+chunk_size} in le-wm's 192-dim latent. The
 # active default for sawseenvlawm runs the *combined* configuration —
 # le-wm side-channel into the action expert (LEWM_INJECT_TO=suffix) AND
-# LGP enabled — to test whether the two pathways stack. Set LGP=false for
-# a side-channel-only run, or LEWM_INJECT_TO=none LGP=true for an LGP-only
+# LATENT_GOAL enabled — to test whether the two pathways stack. Set LATENT_GOAL=false for
+# a side-channel-only run, or LEWM_INJECT_TO=none LATENT_GOAL=true for an LATENT_GOAL-only
 # ablation (which isolates the FS effect; see design/SawSeenVLAWM.md).
-LGP              ?= true
-LGP_LOSS_WEIGHT  ?= 1.0
+LATENT_GOAL              ?= true
+LATENT_GOAL_LOSS_WEIGHT  ?= 1.0
+
+# PEFT (LoRA) — when true, LoRA adapters land on the frozen SmolVLM2
+# text_model q/v_proj. The action expert, the Latent Goal Expert (when
+# on), and all small projections stay fully trainable via
+# ``modules_to_save``. Both experts' losses still update LoRA via the
+# autograd-connected K/V cache. Off by default since the LGE / Mode 3
+# ablations we're benchmarking are full-FT; flip to true for a
+# LoRA + LGE ablation.
+PEFT             ?= false
+LORA_R           ?= 16
+
+# Mode 3 — feed [z_t, z_g] tokens from the Latent Goal Expert into the
+# action expert's suffix. Switches training to a sequential 3-pass
+# forward (prefix → LGE → action with cached VLM K/V); inference adds a
+# K-step LGE denoising pass before the action denoising loop. Off by
+# default — flip to true for the LGE-conditioned-action ablation. Pair
+# with LEWM_INJECT_TO=none to isolate the LGE pathway.
+LATENT_GOAL_INJECT_TO_ACTION ?= true
+# Source of z_g going into the action expert during *training*:
+#   "encoded"   — frozen le-wm CLS of the chunk-end frame from the dataset.
+#                 Train-only; eval still uses LGE's denoised prediction.
+#   "predicted" — LGE's clean prediction reconstructed from its velocity
+#                 (z_g_pred = x_t - t · v). Matches inference distribution.
+# LATENT_GOAL_INJECT_Z_G_SOURCE ?= encoded
+LATENT_GOAL_INJECT_Z_G_SOURCE ?= predicted
+# Detach z_g (and z_t) before the action expert reads them. True =
+# paper-faithful KI-style barrier (action loss cannot reshape LGE).
+# False = differentiable conditioning (LGE also adapts to action loss).
+LATENT_GOAL_INJECT_DETACH ?= true
+# LGE denoising steps used to produce z_g for the action expert during
+# training (Mode 3, source=predicted). 1 = current one-step closed-form
+# reconstruction. Set to LATENT_GOAL_NUM_STEPS (10 by default) to match
+# the eval inference loop exactly — same train/eval z_g distribution at
+# ~2-2.5× per-step wall time. Ignored when source=encoded.
+LATENT_GOAL_TRAIN_NUM_STEPS ?= 10
 
 TRAIN_LAUNCHER  = $(if $(filter-out 1,$(NUM_GPUS)),accelerate launch --multi_gpu --num_processes=$(NUM_GPUS) --mixed_precision=$(MIXED_PRECISION) -m lerobot.scripts.lerobot_train,lerobot-train)
 DOCKER_CUDA_ENV = $(if $(filter-out 1,$(NUM_GPUS)),-e CUDA_VISIBLE_DEVICES=$(shell python3 -c "print(','.join(str(i) for i in range($(NUM_GPUS))))"),)
@@ -138,8 +175,12 @@ train:
 	  --policy.lewm_image_height=$(LEWM_IMAGE_H) \
 	  --policy.lewm_image_width=$(LEWM_IMAGE_W) \
 	  --policy.lewm_inject_to=$(LEWM_INJECT_TO) \
-	  --policy.lgp_enabled=$(LGP) \
-	  --policy.lgp_loss_weight=$(LGP_LOSS_WEIGHT) \
+	  --policy.latent_goal_enabled=$(LATENT_GOAL) \
+	  --policy.latent_goal_loss_weight=$(LATENT_GOAL_LOSS_WEIGHT) \
+	  --policy.latent_goal_inject_to_action=$(LATENT_GOAL_INJECT_TO_ACTION) \
+	  --policy.latent_goal_inject_z_g_source=$(LATENT_GOAL_INJECT_Z_G_SOURCE) \
+	  --policy.latent_goal_inject_detach=$(LATENT_GOAL_INJECT_DETACH) \
+	  --policy.latent_goal_train_num_steps=$(LATENT_GOAL_TRAIN_NUM_STEPS) \
 	  --dataset.repo_id=$(DATASET_REPO) \
 	  --output_dir=$(OUTPUT_DIR) \
 	  --job_name=$(JOB_NAME) \
@@ -150,7 +191,8 @@ train:
 	  --log_freq=$(LOG_FREQ) \
 	  --eval_freq=$(STEPS) \
 	  --wandb.enable=$(WANDB) \
-	  --tensorboard.enable=$(TENSORBOARD)
+	  --tensorboard.enable=$(TENSORBOARD) \
+	  $(if $(filter true,$(PEFT)),--peft.method_type=LORA --peft.r=$(LORA_R),)
 
 eval:
 	$(DOCKER_RUN) lerobot-eval \
