@@ -124,6 +124,15 @@ class LeWMVisionEncoder(nn.Module):
         # positional embedding to whatever (image_height, image_width) we feed.
         self.vit = _build_vit_tiny(image_size=224, patch_size=patch_size)
 
+        # LeWM's projector: MLP(192 → 2048 → 192) with BatchNorm — maps raw
+        # ViT CLS into the JEPA prediction space (where `pred_proj` also
+        # lands). Populated by ``from_lewm_checkpoint``; ``encode_cls`` is
+        # the canonical "scalar latent for an image" entrypoint and applies
+        # it. ``forward`` (returning multi-token slices for the lewm
+        # side-channel) keeps raw ViT hidden states — projector was
+        # supervised on CLS only, so applying it to patch tokens is OOD.
+        self.projector: nn.Module | None = None
+
         # ImageNet normalization buffers (broadcastable to (B, 3, H, W)).
         self.register_buffer(
             "_mean", torch.tensor(_IMAGENET_MEAN).view(1, 3, 1, 1), persistent=False
@@ -136,6 +145,22 @@ class LeWMVisionEncoder(nn.Module):
         if freeze:
             for p in self.vit.parameters():
                 p.requires_grad = False
+
+    def train(self, mode: bool = True) -> "LeWMVisionEncoder":
+        """Override to keep frozen sub-modules in eval mode.
+
+        The projector is an MLP with BatchNorm1d (from le-wm training).
+        When ``freeze=True`` we never want it to recompute running stats
+        on SawSeenVLAWM batches — those would corrupt the frozen feature
+        distribution. ``requires_grad=False`` alone doesn't gate
+        BatchNorm; the explicit ``.eval()`` propagation here does.
+        """
+        super().train(mode)
+        if self.freeze:
+            self.vit.eval()
+            if self.projector is not None:
+                self.projector.eval()
+        return self
 
     @classmethod
     def from_lewm_checkpoint(
@@ -178,12 +203,14 @@ class LeWMVisionEncoder(nn.Module):
                 f"PYTHONPATH or vendor the classes. Original error: {e}"
             ) from e
 
-        # The pickled object is a JEPA module; .encoder is the HF ViT.
-        if not hasattr(obj, "encoder"):
-            raise RuntimeError(
-                f"Unexpected checkpoint structure in {ckpt_path}: missing "
-                f".encoder attribute. Got type {type(obj).__name__}."
-            )
+        # The pickled object is a JEPA module; .encoder is the HF ViT and
+        # .projector is the post-encoder MLP (le-wm/module.py:MLP).
+        for required in ("encoder", "projector"):
+            if not hasattr(obj, required):
+                raise RuntimeError(
+                    f"Unexpected checkpoint structure in {ckpt_path}: missing "
+                    f".{required}. Got type {type(obj).__name__}."
+                )
         encoder_state = obj.encoder.state_dict()
         missing, unexpected = encoder.vit.load_state_dict(encoder_state, strict=False)
         if missing or unexpected:
@@ -198,9 +225,19 @@ class LeWMVisionEncoder(nn.Module):
                 list(unexpected)[:5],
             )
 
+        # Attach the projector as-is — full nn.Module with state already
+        # loaded from the pickle (le-wm/module.py:MLP).
+        encoder.projector = obj.projector
+
         if freeze:
-            for p in encoder.vit.parameters():
+            for p in encoder.parameters():
                 p.requires_grad = False
+            # Force eval mode on BatchNorm-bearing sub-modules. The
+            # ``train()`` override below keeps them eval-locked, but we
+            # also set it explicitly at load so the first forward (before
+            # any ``.train()`` call) is correct.
+            encoder.vit.eval()
+            encoder.projector.eval()
         return encoder
 
     def _normalize(self, img: Tensor) -> Tensor:
@@ -254,6 +291,44 @@ class LeWMVisionEncoder(nn.Module):
         hidden = out.last_hidden_state  # (B, 1+P*P, 192)
         return hidden[:, : self.num_tokens]
 
+    def encode_cls(self, img: Tensor) -> Tensor:
+        """Encode an image to a single 192-d latent in the LeWM JEPA
+        prediction space (post-projector).
+
+        This is the canonical "what does LeWM think this image looks
+        like, as a single vector" call. Output matches the space the
+        LeWM predictor was supervised against, so it is directly
+        comparable to ``LeWMWorldModel.predict_step`` outputs and to
+        anything LGE produces (LGE is trained against this same space).
+
+        Args:
+            img: (B, 3, H, W) float in [-1, 1]; same camera-concatenated
+                layout as ``forward``.
+        Returns:
+            emb: (B, 192) post-projector embedding.
+        """
+        assert self.projector is not None, (
+            "LeWMVisionEncoder.projector not loaded — call from_lewm_checkpoint"
+        )
+        if img.ndim != 4 or img.shape[1] != 3:
+            raise ValueError(f"Expected (B, 3, H, W); got {tuple(img.shape)}")
+        x = self._maybe_resize(img)
+        x = self._normalize(x)
+        vit_param = next(self.vit.parameters())
+        x = x.to(dtype=vit_param.dtype)
+        proj_param = next(self.projector.parameters())
+
+        if self.freeze:
+            with torch.no_grad():
+                out = self.vit(pixel_values=x, interpolate_pos_encoding=True)
+                cls = out.last_hidden_state[:, 0, :]  # (B, 192)
+                emb = self.projector(cls.to(proj_param.dtype))
+        else:
+            out = self.vit(pixel_values=x, interpolate_pos_encoding=True)
+            cls = out.last_hidden_state[:, 0, :]
+            emb = self.projector(cls.to(proj_param.dtype))
+        return emb
+
 
 class LeWMWorldModel(nn.Module):
     """Full le-wm JEPA module lifted from a `<name>_object.ckpt` pickle.
@@ -280,6 +355,8 @@ class LeWMWorldModel(nn.Module):
     ):
         super().__init__()
         # Reuses the vision wrapper's normalize/resize/cast path and ViT.
+        # The projector lives on ``_vision`` so ``encode_cls`` works on
+        # both this wrapper and the standalone encoder consistently.
         self._vision = LeWMVisionEncoder(
             num_tokens=num_tokens,
             image_height=image_height,
@@ -289,7 +366,6 @@ class LeWMWorldModel(nn.Module):
         )
         # Populated by ``from_lewm_checkpoint`` — typed as Module so torch
         # registers them; None until loaded.
-        self.projector: nn.Module | None = None
         self.action_encoder: nn.Module | None = None
         self.predictor: nn.Module | None = None
         self.pred_proj: nn.Module | None = None
@@ -298,6 +374,37 @@ class LeWMWorldModel(nn.Module):
     @property
     def encoder(self) -> LeWMVisionEncoder:
         return self._vision
+
+    @property
+    def projector(self) -> nn.Module | None:
+        """Convenience pointer to ``self._vision.projector`` (the single
+        loaded copy). Predates the refactor where the world model held a
+        separate slot; kept for backwards compatibility."""
+        return self._vision.projector
+
+    def train(self, mode: bool = True) -> "LeWMWorldModel":
+        """Override to keep frozen sub-modules in eval mode.
+
+        ``_vision.train()`` handles the ViT + projector. We additionally
+        force the predictor side back to eval — ``pred_proj`` has
+        BatchNorm1d (le-wm/module.py:MLP with norm_fn=BatchNorm1d) and
+        must not update running stats on SawSeenVLAWM batches. The
+        predictor + action_encoder are LayerNorm-only / norm-free, so
+        the call is technically a no-op for them but harmless.
+        """
+        super().train(mode)
+        if self.freeze:
+            # _vision.train() already eval-locks vit + projector; calling
+            # it explicitly here is redundant (super().train propagates)
+            # but defensive.
+            self._vision.eval()
+            if self.predictor is not None:
+                self.predictor.eval()
+            if self.pred_proj is not None:
+                self.pred_proj.eval()
+            if self.action_encoder is not None:
+                self.action_encoder.eval()
+        return self
 
     @classmethod
     def from_lewm_checkpoint(
@@ -356,7 +463,9 @@ class LeWMWorldModel(nn.Module):
 
         # Attach the rest as-is. They are full nn.Module instances with
         # their state loaded — assignment registers them on the parent.
-        model.projector = obj.projector
+        # Projector goes onto _vision (single canonical holder) so the
+        # encoder wrapper's encode_cls works too.
+        model._vision.projector = obj.projector
         model.action_encoder = obj.action_encoder
         model.predictor = obj.predictor
         model.pred_proj = obj.pred_proj
@@ -364,34 +473,29 @@ class LeWMWorldModel(nn.Module):
         if freeze:
             for p in model.parameters():
                 p.requires_grad = False
+            # Force eval mode on BatchNorm-bearing sub-modules. `train()`
+            # below keeps them locked; this handles the load-time path
+            # before any explicit `.train()` call.
+            model._vision.vit.eval()
+            model._vision.projector.eval()
+            model.pred_proj.eval()
+            model.predictor.eval()
+            model.action_encoder.eval()
         return model
 
-    @torch.no_grad()
     def encode_cls(self, images: list[Tensor]) -> Tensor:
-        """Encode camera-concatenated images and return CLS token (B, 192).
+        """Encode camera-concatenated images and return the post-projector
+        latent (B, 192).
 
-        Mirrors `SawSeenVLAWMModel._encode_lewm_cls`: when more than one
-        camera is provided, concatenate horizontally before encoding so
-        the ViT sees the same layout as le-wm training.
+        Delegates to ``self._vision.encode_cls`` which applies the LeWM
+        projector — output is in the JEPA prediction space, directly
+        comparable to ``predict_step`` outputs.
         """
         if len(images) == 1:
             stacked = images[0]
         else:
             stacked = torch.cat(images, dim=-1)
-        tokens = self._vision(stacked)  # (B, num_tokens, 192)
-        return tokens[:, 0, :]
-
-    @torch.no_grad()
-    def project(self, cls: Tensor) -> Tensor:
-        """Apply le-wm's MLP projector to a CLS token: (B, 192) → (B, 192).
-
-        Output lives in the same space the predictor was supervised
-        against (post-projector embedding). Use this on both z_t and z_g
-        before scoring predictor rollouts.
-        """
-        assert self.projector is not None, "LeWMWorldModel not loaded — call from_lewm_checkpoint"
-        param = next(self.projector.parameters())
-        return self.projector(cls.to(param.dtype))
+        return self._vision.encode_cls(stacked)
 
     @torch.no_grad()
     def encode_actions(self, actions: Tensor) -> Tensor:

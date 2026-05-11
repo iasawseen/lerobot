@@ -178,7 +178,19 @@ class SawSeenVLAWMConfig(PreTrainedConfig):
     #   "predicted" — Latent Goal Expert's clean prediction reconstructed from its
     #                velocity at the sampled flow-matching timestep
     #                (z_g_pred = latent_goal_x_t - t · v_latent_goal). Matches inference.
+    #   "scheduled" — per-sample Bernoulli mix: at step s, each sample
+    #                independently uses ``predicted`` with probability
+    #                p = clamp(s / latent_goal_inject_schedule_end_step, 0, 1)
+    #                and ``encoded`` otherwise. Ramps from 100% teacher
+    #                (encoded) at step 0 → 100% student (predicted) at
+    #                ``schedule_end_step``. Closes the train/eval z_g
+    #                distribution gap gradually rather than at-once.
     latent_goal_inject_z_g_source: str = "encoded"
+    # Step at which the ``scheduled`` source reaches 100% predicted
+    # (linear ramp from step 0). Must be > 0 when source="scheduled";
+    # ignored otherwise. Typical value: equal to ``scheduler_decay_steps``
+    # so the schedule completes alongside the LR cosine decay.
+    latent_goal_inject_schedule_end_step: int = 0
     # Detach z_g (and z_t) before they enter the action expert. True is
     # the paper-faithful KI-style barrier — action loss cannot reshape
     # Latent Goal Expert weights through the conditioning path. False makes the
@@ -219,14 +231,9 @@ class SawSeenVLAWMConfig(PreTrainedConfig):
     # action units; sawseenvlawm actions are unit-std-ish, so 0.1 ≈ 10%
     # of action std).
     mpc_noise_scale: float = 0.1
-    # Latent space the predictor rollout is scored in.
-    #   ``"post_proj"`` — apply le-wm's ``projector`` to z_t (encoded)
-    #     and to z_g (LGE output) so both live in the predictor's
-    #     supervision space. Recommended.
-    #   ``"cls"`` — compare predictor output against LGE-output CLS
-    #     directly. Mismatched spaces (predictor outputs post-proj),
-    #     but matches LGE training target exactly.
-    mpc_score_space: str = "post_proj"
+    # Scoring space is implicit: LeWM's projector is applied at the
+    # encoder wrapper, and LGE is supervised in that same space, so
+    # both z_t and z_g flow into MPC already post-projector. No knob.
     # CEM outer-loop iterations (Scheme B only).
     mpc_cem_num_iter: int = 4
     # CEM elite set size (Scheme B only). Must be < mpc_num_candidates.
@@ -260,10 +267,19 @@ class SawSeenVLAWMConfig(PreTrainedConfig):
                 "action expert reads Latent Goal Expert-predicted z_g, so the Latent Goal Expert head must "
                 "exist."
             )
-        if self.latent_goal_inject_z_g_source not in ("encoded", "predicted"):
+        if self.latent_goal_inject_z_g_source not in ("encoded", "predicted", "scheduled"):
             raise ValueError(
-                f"latent_goal_inject_z_g_source must be 'encoded' or 'predicted'; "
-                f"got {self.latent_goal_inject_z_g_source!r}"
+                f"latent_goal_inject_z_g_source must be 'encoded', 'predicted', or "
+                f"'scheduled'; got {self.latent_goal_inject_z_g_source!r}"
+            )
+        if (
+            self.latent_goal_inject_z_g_source == "scheduled"
+            and self.latent_goal_inject_schedule_end_step <= 0
+        ):
+            raise ValueError(
+                "latent_goal_inject_z_g_source='scheduled' requires "
+                "latent_goal_inject_schedule_end_step > 0 (the step at which "
+                "the schedule reaches 100% predicted)."
             )
         if self.latent_goal_train_num_steps < 1:
             raise ValueError(
@@ -289,10 +305,6 @@ class SawSeenVLAWMConfig(PreTrainedConfig):
             if self.mpc_scheme not in ("anchor_perturb", "cem"):
                 raise ValueError(
                     f"mpc_scheme must be 'anchor_perturb' or 'cem'; got {self.mpc_scheme!r}"
-                )
-            if self.mpc_score_space not in ("post_proj", "cls"):
-                raise ValueError(
-                    f"mpc_score_space must be 'post_proj' or 'cls'; got {self.mpc_score_space!r}"
                 )
             if self.mpc_scheme == "cem":
                 if self.mpc_cem_topk >= self.mpc_num_candidates:

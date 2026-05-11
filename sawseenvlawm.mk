@@ -31,9 +31,8 @@ GPU            ?=
 # Train
 DATASET_REPO   ?= HuggingFaceVLA/libero
 # OUTPUT_DIR     ?= outputs/train/sawseenvlawm_libero_10k_bs64_lewm1_lg_expert_lg_encoded_2xGPUs_bf16
-OUTPUT_DIR     ?= outputs/train/sawseenvlawm_libero_10k_bs64_lewm1_lg_expert_lg_predicted_k10_2xGPUs_bf16
+OUTPUT_DIR     ?= outputs/train/sawseenvlawm_libero_10k_bs64_lewm_proj_lge_scheduled_k10_2xGPUs_bf16
 # OUTPUT_DIR     ?= outputs/train/sawseenvlawm_libero_lora_r16_lewm1_lg_expert_lg_predicted_10k_bs64_2xGPUs_bf16
-# OUTPUT_DIR     ?= outputs/train/sawseenvlawm_test
 JOB_NAME       ?= sawseenvlawm_libero_latent_goal
 STEPS          ?= 10000
 # bs=64 per GPU on 24 GB cards with LATENT_GOAL=true: the LATENT_GOAL expert adds ~98M
@@ -112,8 +111,14 @@ LATENT_GOAL_INJECT_TO_ACTION ?= true
 #                 Train-only; eval still uses LGE's denoised prediction.
 #   "predicted" — LGE's clean prediction reconstructed from its velocity
 #                 (z_g_pred = x_t - t · v). Matches inference distribution.
-# LATENT_GOAL_INJECT_Z_G_SOURCE ?= encoded
-LATENT_GOAL_INJECT_Z_G_SOURCE ?= predicted
+#   "scheduled" — per-sample Bernoulli ramp from encoded (teacher) at
+#                 step 0 to predicted (student) at LATENT_GOAL_INJECT_SCHEDULE_END_STEP.
+#                 Closes the train/eval gap gradually.
+LATENT_GOAL_INJECT_Z_G_SOURCE ?= scheduled
+# Step at which the "scheduled" source reaches 100% predicted (linear
+# ramp from step 0). Default = STEPS so the schedule completes exactly
+# at the end of training. Ignored unless source=scheduled.
+LATENT_GOAL_INJECT_SCHEDULE_END_STEP ?= $(STEPS)
 # Detach z_g (and z_t) before the action expert reads them. True =
 # paper-faithful KI-style barrier (action loss cannot reshape LGE).
 # False = differentiable conditioning (LGE also adapts to action loss).
@@ -133,7 +138,6 @@ MPC                ?= false
 MPC_SCHEME         ?= anchor_perturb  # anchor_perturb | cem
 MPC_NUM_CANDIDATES ?= 16
 MPC_NOISE_SCALE    ?= 0.1
-MPC_SCORE_SPACE    ?= post_proj       # post_proj | cls
 MPC_CEM_NUM_ITER   ?= 4
 MPC_CEM_TOPK       ?= 4
 MPC_CEM_BLEND      ?= 0.5
@@ -192,6 +196,7 @@ train:
 	  --policy.latent_goal_loss_weight=$(LATENT_GOAL_LOSS_WEIGHT) \
 	  --policy.latent_goal_inject_to_action=$(LATENT_GOAL_INJECT_TO_ACTION) \
 	  --policy.latent_goal_inject_z_g_source=$(LATENT_GOAL_INJECT_Z_G_SOURCE) \
+	  --policy.latent_goal_inject_schedule_end_step=$(LATENT_GOAL_INJECT_SCHEDULE_END_STEP) \
 	  --policy.latent_goal_inject_detach=$(LATENT_GOAL_INJECT_DETACH) \
 	  --policy.latent_goal_train_num_steps=$(LATENT_GOAL_TRAIN_NUM_STEPS) \
 	  --dataset.repo_id=$(DATASET_REPO) \
@@ -231,7 +236,6 @@ eval-mpc:
 	  --policy.mpc_scheme=$(MPC_SCHEME) \
 	  --policy.mpc_num_candidates=$(MPC_NUM_CANDIDATES) \
 	  --policy.mpc_noise_scale=$(MPC_NOISE_SCALE) \
-	  --policy.mpc_score_space=$(MPC_SCORE_SPACE) \
 	  --policy.mpc_cem_num_iter=$(MPC_CEM_NUM_ITER) \
 	  --policy.mpc_cem_topk=$(MPC_CEM_TOPK) \
 	  --policy.mpc_cem_anchor_blend=$(MPC_CEM_BLEND) \

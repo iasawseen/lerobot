@@ -266,6 +266,16 @@ class SawSeenVLAWMPolicy(PreTrainedPolicy):
     def get_optim_params(self) -> dict:
         return self.parameters()
 
+    def update(self):
+        """Post-step hook called by the training loop after each optimizer
+        step.
+
+        Increments the inner model's ``_train_step`` counter so the
+        ``scheduled`` z_g-source mode can compute its teacher→student
+        probability based on training progress. No-op otherwise.
+        """
+        self.model._train_step += 1
+
     def _get_action_chunk(
         self, batch: dict[str, Tensor], noise: Tensor | None = None, **kwargs: Unpack[ActionSelectKwargs]
     ) -> Tensor:
@@ -423,6 +433,10 @@ class SawSeenVLAWMPolicy(PreTrainedPolicy):
                 loss_dict["loss_latent_goal"] = latent_goal_loss.item()
             else:
                 loss = loss_action
+            if self.config.latent_goal_inject_z_g_source == "scheduled":
+                step = int(self.model._train_step.item())
+                end = self.config.latent_goal_inject_schedule_end_step
+                loss_dict["latent_goal_schedule_p"] = min(1.0, step / max(1, end))
             loss_dict["loss"] = loss.item()
             return loss, loss_dict
 
@@ -804,6 +818,14 @@ class VLAFlowMatching(nn.Module):
             )
 
         self.set_requires_grad()
+
+        # Training-step counter used by the ``scheduled`` z_g-source mode
+        # to ramp the per-sample teacher→student probability. Incremented
+        # via ``SawSeenVLAWMPolicy.update()`` after each optimizer step;
+        # persists across save/load so resumed training picks up the
+        # schedule where it left off.
+        self.register_buffer("_train_step", torch.zeros(1, dtype=torch.long))
+
         self.fake_image_token = self.vlm_with_expert.processor.tokenizer.fake_image_token_id
         self.global_image_token = self.vlm_with_expert.processor.tokenizer.global_image_token_id
         self.global_image_start_token = torch.tensor(
@@ -1120,22 +1142,25 @@ class VLAFlowMatching(nn.Module):
         att_mask = att_mask[None, :].expand(bsize, 2)
         return embs, pad_mask, att_mask
 
-    def _encode_lewm_cls(self, images: list[torch.Tensor]) -> torch.Tensor:
+    def _encode_lewm_emb(self, images: list[torch.Tensor]) -> torch.Tensor:
         """Encode camera-concatenated images via the frozen le-wm encoder
-        and return the CLS token (B, 192).
+        and return the **post-projector** latent (B, 192).
 
-        Used for both the Latent Goal Expert anchor (current frame) and the Latent Goal Expert regression
-        target (chunk-end frame). Same camera-concat / 224×448 prep that
-        the side-channel encoder uses; gradients are blocked because the
-        encoder is frozen and we only train the Latent Goal Expert head.
+        Routes through ``lewm_encoder.encode_cls``: ViT CLS → LeWM's MLP
+        projector → JEPA prediction space. Used for both the Latent Goal
+        Expert anchor (current frame) and the LGE regression target
+        (chunk-end frame). The result lives in the same space LeWM's
+        predictor was supervised against — directly comparable to
+        ``LeWMWorldModel.predict_step`` outputs and to anything LGE
+        produces (LGE is supervised in this space too). Same camera-concat
+        / 224×448 prep as the side-channel encoder.
         """
         if len(images) == 1:
             stacked = images[0]
         else:
             stacked = torch.cat(images, dim=-1)
         with torch.no_grad():
-            tokens = self.lewm_encoder(stacked)  # (B, num_tokens, 192)
-        return tokens[:, 0, :]  # CLS, (B, 192)
+            return self.lewm_encoder.encode_cls(stacked)  # (B, 192)
 
     def forward(
         self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None,
@@ -1177,8 +1202,8 @@ class VLAFlowMatching(nn.Module):
                     "latent_goal_inject_to_action=True requires chunk_end_images in "
                     "forward(); observation_delta_indices=[0, chunk_size] should be set."
                 )
-            z_t_anchor = self._encode_lewm_cls(images)              # (B, 192)
-            z_g_target = self._encode_lewm_cls(chunk_end_images)    # (B, 192)
+            z_t_anchor = self._encode_lewm_emb(images)              # (B, 192)
+            z_g_target = self._encode_lewm_emb(chunk_end_images)    # (B, 192)
 
             # ── Pass 1: prefix-only forward → VLM K/V cache ──
             prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
@@ -1234,27 +1259,51 @@ class VLAFlowMatching(nn.Module):
                 latent_goal_loss = per_sample_fs.mean()
 
             # ── Build z_g for the action expert ──
-            if self.config.latent_goal_inject_z_g_source == "encoded":
+            source = self.config.latent_goal_inject_z_g_source
+            if source == "encoded":
                 z_g_for_action = z_g_target
-            elif self.config.latent_goal_train_num_steps > 1:
-                # K-step iterative denoise — matches the inference loop
-                # exactly so the action expert sees the same z_g
-                # distribution at train and eval. Runs under no_grad
-                # because z_g is detached on the action-expert side; the
-                # LGE flow-matching signal still comes from the Pass 2
-                # single-t forward above (latent_goal_v).
-                with torch.no_grad():
-                    z_g_for_action = self._latent_goal_denoise(
-                        z_t_anchor, prefix_pad_masks, past_key_values
-                    )
             else:
-                # One-step closed-form reconstruction.
-                # Flow matching: x_t = t·noise + (1-t)·z_g  and  v = noise − z_g
-                #   ⇒  z_g_pred = x_t − t · v
-                z_g_for_action = (
-                    latent_goal_x_t.to(dtype=torch.float32)
-                    - latent_goal_t_exp.to(dtype=torch.float32) * latent_goal_v
-                )
+                # ``predicted`` and ``scheduled`` both need the predicted
+                # latent. ``scheduled`` additionally mixes per-sample
+                # with z_g_target via a Bernoulli mask whose probability
+                # ramps from 0 → 1 across training.
+                if self.config.latent_goal_train_num_steps > 1:
+                    # K-step iterative denoise — matches the inference
+                    # loop exactly so the action expert sees the same
+                    # z_g distribution at train and eval. Runs under
+                    # no_grad because z_g is detached on the action-expert
+                    # side; the LGE flow-matching signal still comes
+                    # from the Pass 2 single-t forward above
+                    # (latent_goal_v).
+                    with torch.no_grad():
+                        z_g_predicted = self._latent_goal_denoise(
+                            z_t_anchor, prefix_pad_masks, past_key_values
+                        )
+                else:
+                    # One-step closed-form reconstruction.
+                    # Flow matching: x_t = t·noise + (1-t)·z_g  and  v = noise − z_g
+                    #   ⇒  z_g_pred = x_t − t · v
+                    z_g_predicted = (
+                        latent_goal_x_t.to(dtype=torch.float32)
+                        - latent_goal_t_exp.to(dtype=torch.float32) * latent_goal_v
+                    )
+
+                if source == "scheduled":
+                    # Per-sample Bernoulli mix:
+                    #   p = clamp(step / end_step, 0, 1)
+                    # mask=1 → use predicted (student); mask=0 → encoded (teacher).
+                    step = int(self._train_step.item())
+                    end = self.config.latent_goal_inject_schedule_end_step
+                    p = min(1.0, step / max(1, end))
+                    bsize = z_g_target.shape[0]
+                    u = torch.rand(bsize, device=z_g_target.device)
+                    use_predicted = (u < p).to(dtype=z_g_target.dtype).unsqueeze(-1)  # (B, 1)
+                    z_g_for_action = (
+                        use_predicted * z_g_predicted.to(dtype=z_g_target.dtype)
+                        + (1.0 - use_predicted) * z_g_target
+                    )
+                else:
+                    z_g_for_action = z_g_predicted
 
             z_t_for_action = z_t_anchor
             if self.config.latent_goal_inject_detach:
@@ -1306,8 +1355,8 @@ class VLAFlowMatching(nn.Module):
             suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(
                 x_t, time, suffix_lewm
             )
-            z_t_anchor = self._encode_lewm_cls(images)              # (B, 192)
-            z_g_target = self._encode_lewm_cls(chunk_end_images)    # (B, 192)
+            z_t_anchor = self._encode_lewm_emb(images)              # (B, 192)
+            z_g_target = self._encode_lewm_emb(chunk_end_images)    # (B, 192)
 
             latent_goal_noise = self.sample_noise(z_g_target.shape, z_g_target.device)
             latent_goal_time = self.sample_time(z_g_target.shape[0], z_g_target.device)
@@ -1399,7 +1448,8 @@ class VLAFlowMatching(nn.Module):
           - suffix_lewm_tokens (or None)
           - prefix_pad_masks, past_key_values
           - latent_goal_inject_tokens (or None)  — Mode 3 only
-          - z_t_cls, z_g_cls (or None each)      — only when LGE active
+          - z_t_emb, z_g_emb (or None each)      — only when LGE active.
+            Both in LeWM post-projector space (JEPA prediction space).
         """
         bsize = state.shape[0]
         device = state.device
@@ -1425,23 +1475,23 @@ class VLAFlowMatching(nn.Module):
         )
 
         latent_goal_inject_tokens: torch.Tensor | None = None
-        z_t_cls: torch.Tensor | None = None
-        z_g_cls: torch.Tensor | None = None
+        z_t_emb: torch.Tensor | None = None
+        z_g_emb: torch.Tensor | None = None
         if mode3:
-            z_t_cls = self._encode_lewm_cls(images)
-            z_g_cls = self._latent_goal_denoise(z_t_cls, prefix_pad_masks, past_key_values)
-            zt_emb = self.latent_goal_action_zt_proj(
-                z_t_cls.to(self.latent_goal_action_zt_proj.weight.dtype)
+            z_t_emb = self._encode_lewm_emb(images)
+            z_g_emb = self._latent_goal_denoise(z_t_emb, prefix_pad_masks, past_key_values)
+            zt_tok = self.latent_goal_action_zt_proj(
+                z_t_emb.to(self.latent_goal_action_zt_proj.weight.dtype)
             )
-            zg_emb = self.latent_goal_action_zg_proj(
-                z_g_cls.to(self.latent_goal_action_zg_proj.weight.dtype)
+            zg_tok = self.latent_goal_action_zg_proj(
+                z_g_emb.to(self.latent_goal_action_zg_proj.weight.dtype)
             )
-            latent_goal_inject_tokens = torch.stack([zt_emb, zg_emb], dim=1)
+            latent_goal_inject_tokens = torch.stack([zt_tok, zg_tok], dim=1)
         elif self.config.mpc_enabled:
             # MPC without Mode 3 still needs both anchors for predictor
             # rollout + scoring. Compute them here on the same cache.
-            z_t_cls = self._encode_lewm_cls(images)
-            z_g_cls = self._latent_goal_denoise(z_t_cls, prefix_pad_masks, past_key_values)
+            z_t_emb = self._encode_lewm_emb(images)
+            z_g_emb = self._latent_goal_denoise(z_t_emb, prefix_pad_masks, past_key_values)
 
         return {
             "bsize": bsize,
@@ -1450,8 +1500,8 @@ class VLAFlowMatching(nn.Module):
             "prefix_pad_masks": prefix_pad_masks,
             "past_key_values": past_key_values,
             "latent_goal_inject_tokens": latent_goal_inject_tokens,
-            "z_t_cls": z_t_cls,
-            "z_g_cls": z_g_cls,
+            "z_t_emb": z_t_emb,
+            "z_g_emb": z_g_emb,
         }
 
     def _denoise_action_chunk(
@@ -1592,23 +1642,17 @@ class VLAFlowMatching(nn.Module):
         return out
 
     def _build_mpc_targets(self, ctx: dict) -> tuple[Tensor, Tensor]:
-        """Map z_t / z_g into the configured scoring space.
+        """Return the (z_t, z_g) pair for predictor scoring.
 
-        ``post_proj`` applies le-wm's MLP projector to both — same space
-        the predictor was supervised against. ``cls`` keeps both in raw
-        CLS space (mismatched against predictor output, but matches
-        LGE's training target).
+        Both are already in LeWM's post-projector space — ``_encode_lewm_emb``
+        applies the projector, and LGE is supervised against the same
+        space. Directly comparable to ``predict_step`` outputs.
         """
-        z_t_cls = ctx["z_t_cls"]
-        z_g_cls = ctx["z_g_cls"]
-        assert z_t_cls is not None and z_g_cls is not None, (
+        z_t_emb = ctx["z_t_emb"]
+        z_g_emb = ctx["z_g_emb"]
+        assert z_t_emb is not None and z_g_emb is not None, (
             "_build_mpc_targets called without LGE state — should be unreachable"
         )
-        if self.config.mpc_score_space == "post_proj":
-            z_t_emb = self.lewm_world.project(z_t_cls)
-            z_g_emb = self.lewm_world.project(z_g_cls)
-        else:
-            z_t_emb, z_g_emb = z_t_cls, z_g_cls
         return z_t_emb.to(torch.float32), z_g_emb.to(torch.float32)
 
     def _anchor_perturb_search(

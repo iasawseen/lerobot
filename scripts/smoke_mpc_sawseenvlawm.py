@@ -69,7 +69,6 @@ def run(
     cfg.mpc_scheme = scheme
     cfg.mpc_num_candidates = num_candidates
     cfg.mpc_noise_scale = 0.1
-    cfg.mpc_score_space = "post_proj"
     cfg.mpc_cem_num_iter = 2
     cfg.mpc_cem_topk = min(2, num_candidates - 1)
     cfg.mpc_cem_anchor_blend = 0.5
@@ -110,6 +109,34 @@ def main():
 
     for scheme in ("anchor_perturb", "cem"):
         run(args.checkpoint, scheme=scheme, num_candidates=args.n, bsize=args.bs, device=args.device)
+
+    # Post-proj wiring sanity checks: load one more time and probe the
+    # encoder's projector + BatchNorm modes directly.
+    print("\n=== Post-projector wiring checks ===")
+    cfg = PreTrainedConfig.from_pretrained(args.checkpoint)
+    cfg.mpc_enabled = True
+    cfg.mpc_scheme = "anchor_perturb"
+    cfg.mpc_num_candidates = 4
+    cfg.__post_init__()
+    policy = SawSeenVLAWMPolicy.from_pretrained(args.checkpoint, config=cfg).to(args.device).eval()
+    enc = policy.model.lewm_encoder
+
+    assert enc.projector is not None, "lewm_encoder.projector not loaded"
+    print(f"  projector loaded: {type(enc.projector).__name__}")
+
+    img = torch.zeros(2, 3, 224, 448, device=args.device)
+    raw = enc(img)[:, 0, :]
+    proj = enc.encode_cls(img)
+    delta = (raw - proj).abs().mean().item()
+    print(f"  encode_cls vs raw CLS mean|Δ|: {delta:.4f} (projector is non-identity)")
+    assert delta > 1e-3, "projector appears to be identity — load failure?"
+
+    # BatchNorm mode should stay eval even after policy.train()
+    policy.train()
+    from torch import nn as _nn
+    bn_modes = [m.training for m in enc.projector.modules() if isinstance(m, _nn.BatchNorm1d)]
+    print(f"  projector BatchNorm.training after policy.train(): {bn_modes}")
+    assert not any(bn_modes), "BatchNorm slipped into train mode — train() override missing"
 
     print("\nSMOKE OK")
 

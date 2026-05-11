@@ -166,7 +166,7 @@ If that's too slow, the cheap knobs are:
 |---|---|
 | **Domain mismatch:** le-wm trained on Libero, but RoboCasa scenes/objects/lighting differ. Frozen encoder may produce useless features. | Start on Libero (matches training distribution); ablate on RoboCasa later. If poor transfer, fine-tune encoder (`lewm_freeze=false`) or skip the WM path on RoboCasa. |
 | **Throughput collapse:** suffix grows 8–12×. | Track step time vs vanilla in the smoke run. Have `lewm_num_tokens=1` (CLS-only) as a backup — recovers near-vanilla speed. |
-| **Projector dropped:** le-wm's MLP projector saw only CLS during training; applying it to patch tokens would be OOD. We use raw ViT hidden states. | Trade-off: features have higher dynamic range than the post-projector ones. Mitigated by the trainable `lewm_proj`. |
+| **Projector applied to CLS only:** le-wm's MLP projector was trained on CLS during JEPA training. The LGE / Mode 3 / MPC pipeline routes through `lewm_encoder.encode_cls()` which applies `projector` — same space the predictor was supervised against. The lewm side-channel path (`compute_lewm_tokens`) keeps raw patch tokens (projector on patches would be OOD); the trainable `lewm_proj` handles the dynamic-range gap there. |
 | **Image-size mismatch:** SawSeenVLA's `resize_imgs_with_padding=(512,512)` defaults vs le-wm's 224. | Encoder bilinearly resizes (with antialias) to 224. May lose detail; if needed, drop SawSeenVLA's resize for the lewm path only. |
 | **bf16 autocast on a frozen ViT:** keeping it in fp32 is safer for numerical stability of frozen weights. | Encoder runs under `torch.no_grad()` when frozen and casts inputs to its parameter dtype (`fp32` by default). |
 | **Multi-camera order matters.** | Python dict insertion order in `present_img_keys` is stable. Document the camera ordering in the run config. |
@@ -298,9 +298,10 @@ expert reads VLM K/V via its own re-projection).
 ```
 Latent Goal Expert suffix = [ z_t_anchor , noisy_z_g + time ]    # 2 tokens, both 720-dim
 
-z_t_anchor  : latent_goal_anchor_proj( lewm_encoder(o_t)[:, 0, :] )
-              # CLS token of the current frame, projected into Latent Goal Expert hidden.
-              # Frozen, deterministic — the Latent Goal Expert's "where am I now."
+z_t_anchor  : latent_goal_anchor_proj( lewm_encoder.encode_cls(o_t) )
+              # projector(CLS) of the current frame — the JEPA prediction space
+              # — then mapped into Latent Goal Expert hidden. Frozen, deterministic —
+              # the Latent Goal Expert's "where am I now."
 
 noisy_z_g+t : latent_goal_time_mlp_out( silu( latent_goal_time_mlp_in( [latent_goal_in_proj(noisy_z), sin_cos_time] ) ) )
               # Standard flow-matching denoising token.
@@ -520,10 +521,40 @@ this roughly matches the action expert's cost — wall-clock latency
 | Field | Default | Notes |
 |---|---|---|
 | `latent_goal_inject_to_action` | `False` | Master switch. Off → bit-identical to Phase A. |
-| `latent_goal_inject_z_g_source` | `"encoded"` | `"encoded"` = train on dataset's chunk-end CLS (clean target, but train≠eval since eval uses LGE's denoised output). `"predicted"` = train on LGE's reconstructed clean prediction `z_g_pred = x_t - t·v` (matches inference distribution; noisier early). |
+| `latent_goal_inject_z_g_source` | `"encoded"` | `"encoded"` = train on dataset's chunk-end CLS (clean target, but train≠eval since eval uses LGE's denoised output). `"predicted"` = train on LGE's reconstructed clean prediction `z_g_pred = x_t - t·v` (matches inference distribution; noisier early). `"scheduled"` = per-sample Bernoulli mix that ramps from 100% encoded (teacher) at step 0 to 100% predicted (student) at `latent_goal_inject_schedule_end_step` — closes the train/eval gap gradually. |
+| `latent_goal_inject_schedule_end_step` | `0` | Required when source=`"scheduled"`. Step at which the schedule reaches 100% predicted (linear ramp from step 0). Typical: equal to `scheduler_decay_steps`. |
 | `latent_goal_inject_detach` | `True` | Detach `z_g` (and `z_t`) before the action expert reads them. False makes the conditioning path differentiable so action loss also reshapes LGE — collapses goal latent toward "whatever helps the policy." |
 
 Requires `latent_goal_enabled=True` (validated in `__post_init__`).
+
+### Scheduled-sampling mode (`source="scheduled"`)
+
+Mixes the two sources via per-sample Bernoulli — at step `s`:
+
+```
+p          = clamp(s / latent_goal_inject_schedule_end_step, 0, 1)
+mask_i     ~ Bernoulli(p)          (i.i.d. per sample in the batch)
+z_g_i      = z_g_predicted_i  if mask_i else z_g_target_i
+```
+
+Each sample sees one *real* source (no soft interpolation that the
+action expert wasn't trained to handle). Standard scheduled-sampling
+recipe from seq2seq, applied to z_g.
+
+Why it helps:
+- Early in training the LGE head is undertrained — its `z_g_predicted`
+  is noise. `encoded` gives the action expert a clean teacher signal
+  so it can learn the conditioning shape.
+- Late in training LGE is well-fit and `encoded` is unavailable at
+  eval. `predicted` matches the eval z_g distribution exactly.
+- The linear ramp gives the action expert a curriculum to gradually
+  tolerate the LGE's noise — never a sharp distribution shift.
+
+Plumbing: a `_train_step` buffer on the inner model is incremented by
+`SawSeenVLAWMPolicy.update()` (called by the training loop after each
+optimizer step). The buffer is persistent, so resuming training picks
+the schedule up where it left off. The current fraction is logged each
+step as `latent_goal_schedule_p`.
 
 ### Run command
 
@@ -620,19 +651,19 @@ def _mpc_score(z_t_emb, z_g_emb, candidates_actions):
 
 ```
 1. Build VLM prefix once: prefix_embs, cache ← vlm_with_expert(prefix, fill_kv=True)
-2. z_t_cls  ← lewm_encoder(o_t).cls                                  (B, 192)
-3. z_g_cls  ← _latent_goal_denoise(z_t_cls, prefix_pad, cache)        (B, 192)
-4. Mode 3 inject_tokens = [proj_zt(z_t_cls), proj_zg(z_g_cls)]        (B, 2, H_act)
+2. z_t_emb  ← lewm_encoder.encode_cls(o_t)                            (B, 192) — projector(CLS)
+3. z_g_emb  ← _latent_goal_denoise(z_t_emb, prefix_pad, cache)        (B, 192) — LGE trained
+                                                                       # in projector space, so
+                                                                       # this is already aligned.
+4. Mode 3 inject_tokens = [proj_zt(z_t_emb), proj_zg(z_g_emb)]        (B, 2, H_act)
 5. ── anchor: standard flow-matching denoising (10 steps), single batch B
        a* = sample_actions_core(...)   shape (B, T, A_raw_padded)
        a*_raw = a*[:, :, :action_dim]    shape (B, T, A_raw)
 6. ── perturbations
        ε     ~ N(0, I) shape (B, N-1, T, A_raw)
        a_k   = a*_raw[:, None] + σ * ε  shape (B, N, T, A_raw)   (k=0 is a* itself)
-7. ── post-projector latents (scoring space)
-       z_t_emb = lewm_world.projector(z_t_cls)   (B, 192)
-       z_g_emb = lewm_world.projector(z_g_cls)   (B, 192)
-8. ── le-wm rollout, batch (B*N)
+7. ── le-wm rollout, batch (B*N) — both z_t_emb and z_g_emb already in the
+       predictor's training space (post-projector); no extra projection needed.
        hist_emb = z_t_emb[:, None, :].expand(-1, HS=3, -1)            (B*N, 3, 192)
        hist_act = a_k[:, :3, :]                                        (B*N, 3, A_raw)
        for t in 0..T-2:
@@ -688,7 +719,6 @@ For comparable wall clock, set `num_iter * N_per_iter ≈ N` of Scheme A
 | `mpc_scheme` | `"anchor_perturb"` | `"anchor_perturb"` (Scheme A, single-shot) or `"cem"` (Scheme B). |
 | `mpc_num_candidates` | `16` | N. Includes the anchor itself as candidate 0 in Scheme A. |
 | `mpc_noise_scale` | `0.1` | σ on perturbations. In normalized-action units; 0.1 ≈ 1/10 of action std. |
-| `mpc_score_space` | `"post_proj"` | `"post_proj"` (recommended) or `"cls"`. Post-proj is the predictor's supervision space; CLS matches LGE's training target but mismatches the predictor side. |
 | `mpc_cem_num_iter` | `4` | Scheme B only. Outer CEM iterations. |
 | `mpc_cem_topk` | `4` | Scheme B only. Elite set per iter. |
 | `mpc_cem_anchor_blend` | `0.5` | Scheme B only. σ-anchoring weight toward `σ_init` (1.0 = pure init, 0.0 = drift freely). |
@@ -705,8 +735,6 @@ if self.mpc_enabled:
     if self.mpc_num_candidates < 2:
         raise ValueError("mpc_num_candidates must be >= 2 (anchor + at least one perturbation)")
     if self.mpc_scheme not in ("anchor_perturb", "cem"):
-        raise ValueError(...)
-    if self.mpc_score_space not in ("post_proj", "cls"):
         raise ValueError(...)
 ```
 
@@ -747,8 +775,7 @@ if self.mpc_enabled:
 | LGE denoise (K=10) | 10× LGE forward | 10× LGE forward |
 | Action denoise (10 steps) | 10× action forward, batch B | 10× action forward, batch B (anchor only) |
 | le-wm rollout | — | 9× ARPredictor forward, batch B·N |
-| le-wm encode (z_t) | already used for LGE anchor | reuse, no new cost |
-| Projector forwards | — | 2 forwards (z_t, z_g) total |
+| le-wm encode (z_t) | reused — `lewm_encoder.encode_cls` already applies the projector | reused, no new cost |
 
 ARPredictor is 5 orders of magnitude smaller than the action expert
 forward per token. Expected wall-clock overhead at N=16: **~10–20%**
@@ -775,7 +802,7 @@ activations.
 | Risk | Notes / mitigation |
 |---|---|
 | **Action-norm gap (accepted).** sawseenvlawm normalizes actions per LeRobotDataset; le-wm uses its own per-column StandardScaler. Magnitudes likely close on libero (both near zero-mean unit-var) but not identical. | v1 measures the gap empirically via the calibration probe. If `cost_anchor` drifts with action magnitude, add a renormalizer in v2. |
-| **LGE-target vs predictor-target space mismatch.** LGE was trained against pre-projector CLS; predictor outputs are post-projector. v1 fixes it by applying `projector` to LGE's z_g at inference. The projection is a learned MLP, so projecting an off-manifold prediction may amplify error. | Calibration probe will catch this. v2: retrain LGE with target = `projector(CLS)` (single-line change in `_encode_lewm_cls`). |
+| **Predictor / projector mode drift.** `projector` and `pred_proj` are BatchNorm-bearing MLPs. If the frozen LeWM submodules slip into `.train()` mode during SawSeenVLAWM fine-tuning, running stats get corrupted from LIBERO batches and the LGE / MPC feature distribution drifts. | `LeWMVisionEncoder.train()` and `LeWMWorldModel.train()` override propagation: when `freeze=True`, force the ViT + projector (+ predictor + pred_proj on the world model) back to `.eval()` regardless of parent mode. |
 | **History-init (z_t, z_t, z_t) is OOD for predictor.** Predictor trained on real 3-frame sequences, never on repeated frames. | First 2 rollout outputs are discarded (we score only the final emb), so the impact is bounded but non-zero. If costs are noisy, switch to history_size=1 or pad with a learned token. |
 | **Candidates collapse around anchor.** If σ is too small or the policy is over-confident, all candidates produce nearly the same `ẑ` and MPC is a no-op. | σ sweep in validation. Also: include a "stochastic flow" mode that re-runs partial denoising from a higher t to broaden the distribution (v2). |
 | **Anchor 'always wins'.** Calibration may favor the anchor's trajectory because the predictor sees in-distribution actions only for the anchor. Perturbations push actions slightly off-policy, which might *increase* predicted-state error without changing real-world outcome. | Use σ small enough that perturbations stay near the action manifold. The argmin-against-z_g objective should still favor genuinely-better candidates when they exist. |
@@ -783,11 +810,42 @@ activations.
 
 ### v1 → v2 roadmap
 
-- v1 (this design): Scheme A + Scheme B selectable, anchor-based, post-proj scoring, accepted action-norm gap.
+- v1 (this design): Scheme A + Scheme B selectable, anchor-based, post-projector scoring (LGE + z_t + predictor all live in the same space — see "LeWM projector wiring" below), accepted action-norm gap.
 - v2 candidates (only if v1 shows promise):
-  - Retrain LGE in post-projector space (eliminates the projection-of-LGE-output hack).
   - Load le-wm action stats and re-normalize.
   - Receding-horizon execute (re-plan every k<chunk_size steps).
   - Stochastic flow for broader sampling (SDE flow / partial denoising).
   - Multi-step LGE goal (predict z at multiple horizons, score with weighted MSE).
+
+### LeWM projector wiring (canonical embedding space)
+
+LeWM's encoder produces a raw 192-d CLS token; its `projector` MLP
+(192 → 2048 → 192 with BatchNorm) maps CLS into the JEPA *prediction
+space* — the space where LeWM's predictor was supervised to land
+(via `pred_proj`). The sawseenvlawm pipeline routes every "scalar
+latent for an image" call through `lewm_encoder.encode_cls()`, which
+applies the projector. That means:
+
+- **LGE training target** `z_g_target = encode_cls(o_{t+chunk_size})`
+  is in projector space.
+- **LGE anchor** `z_t_anchor = encode_cls(o_t)` is in projector
+  space.
+- **Mode 3 inject tokens** `[z_t, z_g]` are both in projector space.
+- **MPC scoring** compares the predictor's post-`pred_proj` rollout
+  output against the LGE-produced (projector-space) `z_g`. Both
+  supervised to land in the same target manifold during JEPA training,
+  so they're directly comparable in MSE.
+
+The lewm side-channel (`compute_lewm_tokens`, prepending raw ViT
+patches + CLS to the action expert's suffix) is the **only** path
+that keeps unprojected features — the projector was trained on CLS
+only, so applying it to patch tokens would be OOD. The trainable
+`lewm_proj` in `embed_suffix` handles the dynamic-range gap on that
+path.
+
+**Checkpoint compatibility.** Checkpoints trained before this change
+have LGE weights tuned to pre-projector CLS targets; loading them
+with the new pipeline produces semantically wrong z_g (predicted in
+the wrong space). There is no auto-migration — those checkpoints
+should be retrained.
 
