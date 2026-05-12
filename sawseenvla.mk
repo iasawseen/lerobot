@@ -195,6 +195,9 @@ MINE_CKPT_PATHS  = $(foreach s,$(MINE_CKPTS),/ckpts/$(s)/pretrained_model)
 
 mine:
 	@mkdir -p $(MINE_OUTPUT_PARENT)
+	@# Make the parent world-writable so the container user (user_lerobot, UID 1001)
+	@# can mkdir the leaf alongside the host's UID 1000 ownership.
+	@chmod 777 $(MINE_OUTPUT_PARENT)
 	docker run $(if $(GPU),--gpus device=$(GPU) -e MUJOCO_EGL_DEVICE_ID=0,--gpus all) --rm \
 	  --shm-size=8g \
 	  -v $(HF_CACHE_DIR):/home/user_lerobot/.cache/huggingface \
