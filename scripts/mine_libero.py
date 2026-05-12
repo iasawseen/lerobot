@@ -275,6 +275,18 @@ def main():
         raise FileExistsError(
             f"output-root {args.output_root} exists and is non-empty; refusing to overwrite"
         )
+    # LeRobotDataset.create() does mkdir(exist_ok=False); the parent must exist
+    # but the leaf must not. Allow an existing empty leaf only if we can rmdir it
+    # (same-UID); otherwise rely on the caller to pass a clean target.
+    if args.output_root.exists():
+        try:
+            args.output_root.rmdir()
+        except OSError as e:
+            raise FileExistsError(
+                f"output-root {args.output_root} exists but cannot be removed "
+                f"(probably a docker bind-mount artifact): {e}. Bind-mount the "
+                f"PARENT directory and pass --output-root /<parent_mount>/<leaf>."
+            ) from e
 
     print(f"Creating dataset at {args.output_root}")
     dataset = LeRobotDataset.create(
@@ -346,7 +358,9 @@ def main():
                         dataset.save_episode()
                         mining_log.append({
                             "global_episode_index": global_ep,
-                            "ckpt": ckpt_path.name,
+                            # Most ckpt paths end in ".../<step>/pretrained_model"; use the
+                            # parent dir as the short tag, fall back to .name otherwise.
+                            "ckpt": ckpt_path.parent.name if ckpt_path.name == "pretrained_model" else ckpt_path.name,
                             "ckpt_path": str(ckpt_path),
                             "suite": suite,
                             "task_id": tid,

@@ -183,17 +183,24 @@ MINE_SEED        ?= 0
 # (e.g. MINE_TASK_IDS="0 1" mines only the first two tasks of each suite).
 MINE_TASK_IDS    ?=
 
+# We bind-mount the PARENT directory and let the container create the leaf
+# itself — LeRobotDataset.create()'s mkdir(exist_ok=False) chokes on a
+# pre-existing leaf, and the container user (UID 1001) can't rmdir host-owned
+# (UID 1000) bind-mount artifacts. Split the host path into parent/leaf.
+MINE_OUTPUT_PARENT = $(patsubst %/,%,$(dir $(MINE_OUTPUT_HOST)))
+MINE_OUTPUT_NAME   = $(notdir $(MINE_OUTPUT_HOST))
+
 # Build the container-side ckpt paths from MINE_CKPTS (each step → /ckpts/<step>/pretrained_model).
 MINE_CKPT_PATHS  = $(foreach s,$(MINE_CKPTS),/ckpts/$(s)/pretrained_model)
 
 mine:
-	@mkdir -p $(MINE_OUTPUT_HOST)
+	@mkdir -p $(MINE_OUTPUT_PARENT)
 	docker run $(if $(GPU),--gpus device=$(GPU) -e MUJOCO_EGL_DEVICE_ID=0,--gpus all) --rm \
 	  --shm-size=8g \
 	  -v $(HF_CACHE_DIR):/home/user_lerobot/.cache/huggingface \
 	  -v $(LIBERO_CACHE_DIR):/home/user_lerobot/.cache/libero \
 	  -v $(MINE_CKPT_ROOT):/ckpts:ro \
-	  -v $(MINE_OUTPUT_HOST):/datasets/sawseenvla_libero_mined \
+	  -v $(MINE_OUTPUT_PARENT):/datasets \
 	  -v $(CURDIR)/src:/lerobot/src \
 	  -v $(CURDIR)/scripts:/lerobot/scripts \
 	  -e MUJOCO_GL=egl \
@@ -205,7 +212,7 @@ mine:
 	    --ckpts $(MINE_CKPT_PATHS) \
 	    --eps-per-task $(MINE_EPS_PER_TASK) \
 	    --suites $(MINE_SUITES) \
-	    --output-root /datasets/sawseenvla_libero_mined \
+	    --output-root /datasets/$(MINE_OUTPUT_NAME) \
 	    --repo-id $(MINE_REPO_ID) \
 	    --seed $(MINE_SEED) \
 	    $(if $(MINE_TASK_IDS),--task-ids $(MINE_TASK_IDS))
