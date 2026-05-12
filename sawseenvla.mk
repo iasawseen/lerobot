@@ -110,7 +110,7 @@ DOCKER_RUN = docker run $(if $(GPU),--gpus device=$(GPU) -e MUJOCO_EGL_DEVICE_ID
 	  -w /lerobot \
 	  $(DOCKER_IMAGE)
 
-.PHONY: build train eval table
+.PHONY: build train eval table mine
 
 build:
 	docker build -f docker/Dockerfile.benchmark.libero -t $(DOCKER_IMAGE) .
@@ -162,3 +162,50 @@ TABLE_LABEL    ?= Policy
 
 table:
 	@python3 eval_table.py $(TABLE_RUN) --label "$(TABLE_LABEL)" $(if $(TABLE_LATEX),--latex)
+
+# ─── Mining: roll out SawSeenVLA checkpoints in LIBERO sim, record trajectories
+# in LeRobot v3 format for downstream LeWM training. Mixes three checkpoints
+# (early/mid/late) to seed off-expert state coverage. Output schema matches
+# HuggingFaceVLA/libero so it can be concatenated with the expert dataset by
+# le-wm/scripts/libero_to_h5.py (multi-source support).
+#
+# Host paths for the SawSeenVLA training run and the output dataset (defaults
+# match the user's local setup; override on the command line). MINE_CKPT_ROOT
+# must contain the `<step>/pretrained_model/` subdirs referenced by MINE_CKPTS.
+MINE_CKPT_ROOT   ?= /mnt/hard_disk_16Tb/data/lerobot/outputs/train/sawseenvla_libero_8k_bs96_2xGPUs_bf16/checkpoints
+MINE_CKPTS       ?= 002000 004000 006000
+MINE_EPS_PER_TASK ?= 4 3 3
+MINE_SUITES      ?= libero_spatial libero_object libero_goal libero_10
+MINE_OUTPUT_HOST ?= /mnt/hard_disk_16Tb/data/lerobot/datasets/sawseenvla_libero_mined
+MINE_REPO_ID     ?= local/sawseenvla_libero_mined
+MINE_SEED        ?= 0
+# Optional: restrict to a few task_ids per suite for smoke-testing
+# (e.g. MINE_TASK_IDS="0 1" mines only the first two tasks of each suite).
+MINE_TASK_IDS    ?=
+
+# Build the container-side ckpt paths from MINE_CKPTS (each step → /ckpts/<step>/pretrained_model).
+MINE_CKPT_PATHS  = $(foreach s,$(MINE_CKPTS),/ckpts/$(s)/pretrained_model)
+
+mine:
+	@mkdir -p $(MINE_OUTPUT_HOST)
+	docker run $(if $(GPU),--gpus device=$(GPU) -e MUJOCO_EGL_DEVICE_ID=0,--gpus all) --rm \
+	  --shm-size=8g \
+	  -v $(HF_CACHE_DIR):/home/user_lerobot/.cache/huggingface \
+	  -v $(LIBERO_CACHE_DIR):/home/user_lerobot/.cache/libero \
+	  -v $(MINE_CKPT_ROOT):/ckpts:ro \
+	  -v $(MINE_OUTPUT_HOST):/datasets/sawseenvla_libero_mined \
+	  -v $(CURDIR)/src:/lerobot/src \
+	  -v $(CURDIR)/scripts:/lerobot/scripts \
+	  -e MUJOCO_GL=egl \
+	  -e HF_DATASETS_CACHE=/tmp/hf-datasets \
+	  $(DOCKER_CUDA_ENV) \
+	  -w /lerobot \
+	  $(DOCKER_IMAGE) \
+	  python scripts/mine_libero.py \
+	    --ckpts $(MINE_CKPT_PATHS) \
+	    --eps-per-task $(MINE_EPS_PER_TASK) \
+	    --suites $(MINE_SUITES) \
+	    --output-root /datasets/sawseenvla_libero_mined \
+	    --repo-id $(MINE_REPO_ID) \
+	    --seed $(MINE_SEED) \
+	    $(if $(MINE_TASK_IDS),--task-ids $(MINE_TASK_IDS))
