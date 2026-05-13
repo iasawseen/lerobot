@@ -183,6 +183,15 @@ MINE_SEED        ?= 0
 # (e.g. MINE_TASK_IDS="0 1" mines only the first two tasks of each suite).
 MINE_TASK_IDS    ?=
 
+# iCEM-style colored noise injected on top of the VLA's action per step.
+# Pure-policy rollouts when std=0. Recommended starting point: std=0.1, beta=2.
+# Use --use-async-envs flag for AsyncVectorEnv when n_envs per task is large
+# (subprocess per env; cleaner EGL contexts, higher throughput at the cost of
+# extra startup time per task).
+MINE_NOISE_STD   ?= 0.0
+MINE_NOISE_BETA  ?= 2.0
+MINE_USE_ASYNC   ?= false
+
 # We bind-mount the PARENT directory and let the container create the leaf
 # itself — LeRobotDataset.create()'s mkdir(exist_ok=False) chokes on a
 # pre-existing leaf, and the container user (UID 1001) can't rmdir host-owned
@@ -196,8 +205,9 @@ MINE_CKPT_PATHS  = $(foreach s,$(MINE_CKPTS),/ckpts/$(s)/pretrained_model)
 mine:
 	@mkdir -p $(MINE_OUTPUT_PARENT)
 	@# Make the parent world-writable so the container user (user_lerobot, UID 1001)
-	@# can mkdir the leaf alongside the host's UID 1000 ownership.
-	@chmod 777 $(MINE_OUTPUT_PARENT)
+	@# can mkdir the leaf alongside the host's UID 1000 ownership. Swallow
+	@# failures for already-writable system dirs (e.g. /tmp, sticky bit 1777).
+	@chmod 777 $(MINE_OUTPUT_PARENT) 2>/dev/null || true
 	docker run $(if $(GPU),--gpus device=$(GPU) -e MUJOCO_EGL_DEVICE_ID=0,--gpus all) --rm \
 	  --shm-size=8g \
 	  -v $(HF_CACHE_DIR):/home/user_lerobot/.cache/huggingface \
@@ -218,4 +228,7 @@ mine:
 	    --output-root /datasets/$(MINE_OUTPUT_NAME) \
 	    --repo-id $(MINE_REPO_ID) \
 	    --seed $(MINE_SEED) \
+	    --action-noise-std $(MINE_NOISE_STD) \
+	    --noise-beta $(MINE_NOISE_BETA) \
+	    $(if $(filter true,$(MINE_USE_ASYNC)),--use-async-envs,) \
 	    $(if $(MINE_TASK_IDS),--task-ids $(MINE_TASK_IDS))

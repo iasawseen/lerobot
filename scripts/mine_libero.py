@@ -62,6 +62,35 @@ FEATURES: dict[str, dict] = {
 }
 
 
+def icem_colored_noise(
+    n_envs: int, T: int, action_dim: int,
+    beta: float = 2.0, scale: float = 1.0,
+    rng: np.random.Generator | None = None,
+) -> np.ndarray:
+    """Generate per-env colored-noise action perturbations.
+
+    Power spectrum density ∝ 1/f^beta along the time axis (Pinneri et al. 2020,
+    "iCEM"). beta=0 = white Gaussian noise, beta=1 = pink, beta=2 = red/Brownian.
+    Each env gets an independent sequence; per (env, dim) the std is normalized
+    to 1.0 so the `scale` argument is directly the per-step std.
+
+    Returns: (n_envs, T, action_dim) float32, ready to add to (action_chunk * scale).
+    """
+    rng = rng if rng is not None else np.random.default_rng()
+    white = rng.standard_normal((n_envs, T, action_dim))
+    freq = np.fft.rfft(white, axis=1)
+    freqs = np.fft.rfftfreq(T)
+    weights = np.zeros_like(freqs)
+    if beta > 0 and len(freqs) > 1:
+        weights[1:] = freqs[1:] ** (-beta / 2.0)
+    else:  # white-noise fallback
+        weights[1:] = 1.0
+    colored = np.fft.irfft(freq * weights[None, :, None], n=T, axis=1)
+    std = colored.std(axis=1, keepdims=True) + 1e-8
+    colored = colored / std
+    return (scale * colored).astype(np.float32)
+
+
 def quat_to_axis_angle(quat: np.ndarray) -> np.ndarray:
     """numpy port of LiberoProcessorStep._quat2axisangle. Input (x, y, z, w)."""
     q = np.asarray(quat, dtype=np.float32).reshape(4)
@@ -138,6 +167,9 @@ def run_one_task(
     n_envs: int,
     device: torch.device,
     base_seed: int,
+    action_noise_std: float = 0.0,
+    noise_beta: float = 2.0,
+    use_async_envs: bool = False,
 ):
     """Run one rollout of n_envs parallel envs for (suite_name, task_id).
 
@@ -149,6 +181,9 @@ def run_one_task(
             "success": bool,
             "num_frames": int,
         }
+
+    If action_noise_std > 0, iCEM-style colored noise (1/f^noise_beta) is added
+    to the policy's action per step. Per-env noise sequences are independent.
     """
     env_cfg = LiberoEnvConfig(
         task=suite_name,
@@ -157,7 +192,7 @@ def run_one_task(
         observation_height=IMG_H,
         observation_width=IMG_W,
     )
-    envs_dict = env_cfg.create_envs(n_envs=n_envs, use_async_envs=False)
+    envs_dict = env_cfg.create_envs(n_envs=n_envs, use_async_envs=use_async_envs)
     vec_env = envs_dict[suite_name][task_id]
 
     try:
@@ -169,6 +204,18 @@ def run_one_task(
         policy.reset()
         seeds = [base_seed + task_id * 1000 + i for i in range(n_envs)]
         obs_raw, info = vec_env.reset(seed=seeds)
+
+        # Pre-generate the colored-noise trajectory for this task-run. Same
+        # length as max_steps; indexed per env by global step counter (across
+        # any in-task auto-resets — done envs stop recording but the index
+        # advances anyway, which is fine since we never re-use those rows).
+        noise = None
+        if action_noise_std > 0.0:
+            noise_rng = np.random.default_rng(base_seed + 42 * task_id)
+            noise = icem_colored_noise(
+                n_envs=n_envs, T=max_steps, action_dim=7,
+                beta=noise_beta, scale=action_noise_std, rng=noise_rng,
+            )
 
         # capture initial init_state_id from each sub-env (post-reset, so already bumped)
         try:
@@ -195,6 +242,8 @@ def run_one_task(
                 env_postprocessor=env_post,
                 device=device,
             )  # (n_envs, 7)
+            if noise is not None:
+                action_np = np.clip(action_np + noise[:, step], -1.0, 1.0).astype(np.float32)
 
             # Record (obs, action) for the envs still running BEFORE stepping
             for i in range(n_envs):
@@ -262,6 +311,14 @@ def main():
     p.add_argument("--device", default="cuda")
     p.add_argument("--seed", type=int, default=0,
                    help="Base seed for env init / per-env seeding.")
+    p.add_argument("--action-noise-std", type=float, default=0.0,
+                   help="iCEM-style colored-noise std added to policy actions per step "
+                        "(0.0 = pure policy rollouts). Recommended: 0.05-0.1.")
+    p.add_argument("--noise-beta", type=float, default=2.0,
+                   help="Colored-noise power-spectrum exponent. 0=white, 1=pink, 2=red.")
+    p.add_argument("--use-async-envs", action="store_true",
+                   help="Use AsyncVectorEnv for per-env subprocess parallelism "
+                        "(higher throughput at high n_envs, more startup cost).")
     args = p.parse_args()
 
     if len(args.ckpts) != len(args.eps_per_task):
@@ -348,6 +405,9 @@ def main():
                         n_envs=n_eps_per_task,
                         device=device,
                         base_seed=args.seed + pass_idx * 100_000,
+                        action_noise_std=args.action_noise_std,
+                        noise_beta=args.noise_beta,
+                        use_async_envs=args.use_async_envs,
                     )
 
                     for ep in episodes:
