@@ -187,10 +187,19 @@ class SawSeenVLAWMConfig(PreTrainedConfig):
     #                distribution gap gradually rather than at-once.
     latent_goal_inject_z_g_source: str = "encoded"
     # Step at which the ``scheduled`` source reaches 100% predicted
-    # (linear ramp from step 0). Must be > 0 when source="scheduled";
-    # ignored otherwise. Typical value: equal to ``scheduler_decay_steps``
-    # so the schedule completes alongside the LR cosine decay.
+    # (linear ramp from ``latent_goal_inject_schedule_start_step``). Must
+    # be > ``latent_goal_inject_schedule_start_step`` when
+    # source="scheduled"; ignored otherwise. Typical value: equal to
+    # ``scheduler_decay_steps`` so the schedule completes alongside the
+    # LR cosine decay.
     latent_goal_inject_schedule_end_step: int = 0
+    # Step at which the ``scheduled`` ramp *starts*. Before this step,
+    # p=0 (pure ``encoded`` teacher). From start_step → end_step, p ramps
+    # linearly from 0 → 1. Default 0 = ramp from the very beginning of
+    # training (legacy behavior). Set > 0 to keep the action expert on
+    # the clean teacher signal until LGE has had time to fit, then start
+    # blending in its predictions. Ignored unless source="scheduled".
+    latent_goal_inject_schedule_start_step: int = 0
     # Detach z_g (and z_t) before they enter the action expert. True is
     # the paper-faithful KI-style barrier — action loss cannot reshape
     # Latent Goal Expert weights through the conditioning path. False makes the
@@ -208,6 +217,24 @@ class SawSeenVLAWMConfig(PreTrainedConfig):
     # flow-matching loss still comes from the separate single-t LGE
     # forward. Ignored when source="encoded" or inject_to_action=False.
     latent_goal_train_num_steps: int = 1
+
+    # ── SIGReg on the LGE's reconstructed clean prediction ───────────
+    # Sketch Isotropic Gaussian Regularizer (Epps-Pulley statistic on
+    # random 1-D projections; ported from le-wm/module.py:SIGReg). Pulls
+    # the LGE's one-step-reconstructed clean prediction
+    # ``z_g_pred = latent_goal_x_t - t · v`` toward an isotropic-Gaussian
+    # marginal distribution. Off by default. Worth trying when Mode 3
+    # source="predicted"/"scheduled" — the action expert is trained to
+    # condition on z_g distributed like le-wm's projector output
+    # (already SIGReg-shaped during JEPA training); SIGReg on z_g_pred
+    # makes that distribution match explicit, in case MSE-against-target
+    # isn't enough to land the marginals there on its own.
+    # ``weight=0.0`` short-circuits the module entirely (no extra forward).
+    # The signal is single-GPU; under DDP each rank computes the
+    # statistic on its own batch shard.
+    latent_goal_sigreg_weight: float = 0.0
+    latent_goal_sigreg_knots: int = 17
+    latent_goal_sigreg_num_proj: int = 1024
 
     # ── Phase B: MPC inference with le-wm predictor ──────────────────
     # Runtime-only addition. When True, ``sample_actions`` produces a
@@ -242,6 +269,65 @@ class SawSeenVLAWMConfig(PreTrainedConfig):
     # elite.std() * (1 - blend) + mpc_noise_scale * blend. 1.0 = pure
     # init σ each iter; 0.0 = σ drifts freely from elites. Scheme B only.
     mpc_cem_anchor_blend: float = 0.5
+    # ── CEM variant knobs (mirror le-wm's reference CEMSolver) ───────
+    # Whether the policy anchor occupies candidate slot 0 every iter
+    # (the AI-CEM variant). When False, slot 0 is the current μ instead
+    # — matching le-wm's ``CEMSolver`` semantics (anchor never enters
+    # the elite pool, so the search is unbiased by the policy prior).
+    mpc_cem_include_anchor: bool = True
+    # Initial μ_0. "anchor" = the policy's flow-matched chunk (default
+    # — the policy prior seeds the search). "zero" = zeros, ignoring
+    # the policy entirely (le-wm's default: ``init_action_distrib``
+    # returns zeros when ``init_action=None``).
+    mpc_cem_init_mean: str = "anchor"
+    # What CEM returns at the end. "best_ever" tracks the
+    # lowest-cost candidate seen across all iters (safer when M is
+    # small and σ may not have converged). "final_mean" returns the
+    # converged μ from the last iter (le-wm reference; relies on
+    # σ-shrinkage to make μ a meaningful elite consensus).
+    mpc_cem_return: str = "best_ever"
+    # ── MPPI (Scheme C) — cost-weighted softmax aggregation ──────────
+    # Temperature β for the softmax: weights_k = softmax(−cost_k / β).
+    # β → 0  recovers hard argmin (every candidate's weight collapses
+    #         onto the lowest-cost one).
+    # β → ∞  recovers a uniform average over candidates.
+    # Costs are sum-of-squares L2 in 192-d projector space, so the
+    # absolute scale depends on the predictor and the scene; tune
+    # against the cost distribution rather than against unit intuition.
+    mpc_mppi_temperature: float = 1.0
+    # MPPI outer-loop iterations. Default M=4 matches CEM's iteration
+    # count and total predictor rollouts (N · M = 64), so MPPI-vs-CEM
+    # is a fair head-to-head at fixed compute. M=1 recovers vanilla
+    # single-shot MPPI — useful as a "softmax beats argmin at AP's
+    # budget" sanity check, but under-explores in our one-shot-per-chunk
+    # setup (no receding horizon to re-anchor μ).
+    mpc_mppi_num_iter: int = 4
+    # ── Score-floor escape (all schemes) ─────────────────────────────
+    # Return the anchor unchanged unless the best candidate's cost is
+    # materially lower: deviate only when
+    #   (anchor_cost − best_cost) / anchor_cost ≥ mpc_score_floor_margin.
+    # 0.0 (default) = disabled — return whatever the scheme picked, same
+    # as the per-scheme best-ever-tracking floor (always ≤ anchor on
+    # score, but vulnerable to predictor score-noise rank-inversion on
+    # near-perfect anchors). 0.05 = require ≥ 5% relative improvement
+    # before deviating. Higher values strengthen the anchor preference;
+    # at margin → 1, MPC effectively becomes "return anchor" (no
+    # candidate can clear a 100%+ improvement bar).
+    # Per-batch (each chunk decision in the eval batch is gated
+    # independently).
+    mpc_score_floor_margin: float = 0.0
+    # ── iCEM colored-noise exponent (all schemes) ────────────────────
+    # Power-law spectral exponent for action-chunk perturbations: noise
+    # PSD ∝ 1/f^β along the time axis. 0.0 (default) = white noise =
+    # legacy behavior. 1.0 = pink. 2.0 = red/Brownian — the iCEM default
+    # (Pinneri et al. 2020). Higher β = smoother, more temporally
+    # correlated perturbations, which (1) stay closer to the manifold of
+    # real action trajectories the le-wm predictor was trained on, and
+    # (2) explore the cost surface in a structurally meaningful way
+    # rather than as per-timestep jitter. Per-trajectory unit-std
+    # normalization keeps the σ semantics from ``mpc_noise_scale``
+    # unchanged. Works for cem and mppi (and anchor_perturb).
+    mpc_icem_beta: float = 0.0
     # Path to a le-wm ``<name>_object.ckpt`` pickle that contains the
     # full JEPA (encoder + projector + action_encoder + predictor +
     # pred_proj). Falls back to ``lewm_encoder_path`` when None — the
@@ -281,10 +367,46 @@ class SawSeenVLAWMConfig(PreTrainedConfig):
                 "latent_goal_inject_schedule_end_step > 0 (the step at which "
                 "the schedule reaches 100% predicted)."
             )
+        if self.latent_goal_inject_schedule_start_step < 0:
+            raise ValueError(
+                "latent_goal_inject_schedule_start_step must be ≥ 0; got "
+                f"{self.latent_goal_inject_schedule_start_step}"
+            )
+        if (
+            self.latent_goal_inject_z_g_source == "scheduled"
+            and self.latent_goal_inject_schedule_start_step
+            >= self.latent_goal_inject_schedule_end_step
+        ):
+            raise ValueError(
+                "latent_goal_inject_z_g_source='scheduled' requires "
+                "latent_goal_inject_schedule_start_step < "
+                "latent_goal_inject_schedule_end_step; got start="
+                f"{self.latent_goal_inject_schedule_start_step} end="
+                f"{self.latent_goal_inject_schedule_end_step}"
+            )
         if self.latent_goal_train_num_steps < 1:
             raise ValueError(
                 "latent_goal_train_num_steps must be ≥ 1; got "
                 f"{self.latent_goal_train_num_steps}"
+            )
+        if self.latent_goal_sigreg_weight < 0:
+            raise ValueError(
+                "latent_goal_sigreg_weight must be ≥ 0; got "
+                f"{self.latent_goal_sigreg_weight}"
+            )
+        if self.latent_goal_sigreg_weight > 0 and not self.latent_goal_enabled:
+            raise ValueError(
+                "latent_goal_sigreg_weight > 0 requires latent_goal_enabled=True — "
+                "SIGReg targets the LGE's reconstructed z_g_pred, which only exists "
+                "when the Latent Goal Expert is on."
+            )
+        if self.latent_goal_sigreg_knots < 2:
+            raise ValueError(
+                f"latent_goal_sigreg_knots must be ≥ 2; got {self.latent_goal_sigreg_knots}"
+            )
+        if self.latent_goal_sigreg_num_proj < 1:
+            raise ValueError(
+                f"latent_goal_sigreg_num_proj must be ≥ 1; got {self.latent_goal_sigreg_num_proj}"
             )
         if self.mpc_enabled:
             if not self.latent_goal_enabled:
@@ -302,9 +424,10 @@ class SawSeenVLAWMConfig(PreTrainedConfig):
                     "mpc_num_candidates must be ≥ 2 (anchor + at least one "
                     f"perturbation); got {self.mpc_num_candidates}"
                 )
-            if self.mpc_scheme not in ("anchor_perturb", "cem"):
+            if self.mpc_scheme not in ("anchor_perturb", "cem", "mppi"):
                 raise ValueError(
-                    f"mpc_scheme must be 'anchor_perturb' or 'cem'; got {self.mpc_scheme!r}"
+                    f"mpc_scheme must be 'anchor_perturb', 'cem', or 'mppi'; "
+                    f"got {self.mpc_scheme!r}"
                 )
             if self.mpc_scheme == "cem":
                 if self.mpc_cem_topk >= self.mpc_num_candidates:
@@ -321,6 +444,36 @@ class SawSeenVLAWMConfig(PreTrainedConfig):
                         "mpc_cem_anchor_blend must be in [0, 1]; got "
                         f"{self.mpc_cem_anchor_blend}"
                     )
+                if self.mpc_cem_init_mean not in ("anchor", "zero"):
+                    raise ValueError(
+                        "mpc_cem_init_mean must be 'anchor' or 'zero'; got "
+                        f"{self.mpc_cem_init_mean!r}"
+                    )
+                if self.mpc_cem_return not in ("best_ever", "final_mean"):
+                    raise ValueError(
+                        "mpc_cem_return must be 'best_ever' or 'final_mean'; got "
+                        f"{self.mpc_cem_return!r}"
+                    )
+            if self.mpc_scheme == "mppi":
+                if self.mpc_mppi_temperature <= 0:
+                    raise ValueError(
+                        "mpc_mppi_temperature must be > 0; got "
+                        f"{self.mpc_mppi_temperature}"
+                    )
+                if self.mpc_mppi_num_iter < 1:
+                    raise ValueError(
+                        f"mpc_mppi_num_iter must be ≥ 1; got {self.mpc_mppi_num_iter}"
+                    )
+            if self.mpc_score_floor_margin < 0:
+                raise ValueError(
+                    "mpc_score_floor_margin must be ≥ 0; got "
+                    f"{self.mpc_score_floor_margin}"
+                )
+            if self.mpc_icem_beta < 0:
+                raise ValueError(
+                    "mpc_icem_beta must be ≥ 0 (0=white, 1=pink, 2=red); got "
+                    f"{self.mpc_icem_beta}"
+                )
             if self.rtc_config is not None and self.rtc_config.enabled:
                 raise ValueError(
                     "mpc_enabled and RTC are mutually exclusive — RTC partially "

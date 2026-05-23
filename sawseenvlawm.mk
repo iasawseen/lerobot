@@ -26,13 +26,20 @@ LEWM_CKPT_NAME ?= lewm_epoch_10_object.ckpt
 # `JEPA` object that imports `module` and `jepa` modules during torch.load.
 # Mounted read-only at /lewm-src and prepended to PYTHONPATH.
 LEWM_SRC_DIR   ?= $(HOME)/data/reps/le-wm
+# Host directory where checkpoints / eval results land. Bind-mounted at
+# the same absolute path inside the container, so OUTPUT_DIR is a single
+# host-equals-container path that ``--output_dir`` consumes directly.
+# Pre-create the directory if you hit permission errors (docker will
+# create it as root otherwise).
+OUTPUTS_HOST_DIR ?= /mnt/hard_disk_16Tb/data/lerobot/outputs
 GPU            ?=
 
 # Train
 DATASET_REPO   ?= HuggingFaceVLA/libero
-OUTPUT_DIR     ?= outputs/train/sawseenvlawm_libero_12k_bs64_lewm_proj_lge_scheduled_k10_2xGPUs_bf16
+OUTPUT_DIR     ?= $(OUTPUTS_HOST_DIR)/train/sawseenvlawm_libero_12k_bs64_lewm_proj_lge_sigreg_scheduled_middle_k10_2xGPUs_bf16
 JOB_NAME       ?= sawseenvlawm_libero_latent_goal
 STEPS          ?= 12000
+
 # bs=64 per GPU on 24 GB cards with LATENT_GOAL=true: the LATENT_GOAL expert adds ~98M
 # trainable params + ~2 extra tokens through the full VLM/expert stack on
 # top of the side-channel suffix. Drop bs further (32) if you also push
@@ -42,10 +49,12 @@ BATCH_SIZE     ?= 64
 NUM_WORKERS    ?= 4
 SAVE_FREQ      ?= 1000
 LOG_FREQ       ?= 100
+
 # Sqrt-scaled from the bs64 baseline (LR=4e-4 at global_batch=128):
 # LR ≈ 4e-4 × sqrt(global_batch/128). Default tuned for BATCH_SIZE=64
 # NUM_GPUS=2 (global_batch=128 → LR=4.0e-4). Re-scale if you change either.
 LR             ?= 4.0e-4
+
 # Default OFF for the WM variant: torch.compile masks shape mismatches and
 # adds a long warmup that's unhelpful while iterating on the lewm wiring.
 # Flip to true for production / throughput-sensitive runs once stable.
@@ -68,6 +77,7 @@ LEWM_NUM_TOKENS  ?= 1
 LEWM_FREEZE      ?= true
 LEWM_IMAGE_H     ?= 224
 LEWM_IMAGE_W     ?= 448
+
 # Where lewm tokens enter the model:
 #   suffix → projected to expert_hidden_size, prepended to action expert
 #   none   → encoder loaded but not injected into the action expert; used for
@@ -87,6 +97,11 @@ LEWM_INJECT_TO   ?= suffix
 LATENT_GOAL              ?= true
 LATENT_GOAL_LOSS_WEIGHT  ?= 1.0
 
+# SIGReg on the LGE's reconstructed clean prediction. Off by default.
+# Le-wm uses weight=0.09 for SIGReg on its encoder during JEPA training;
+# 0.09 is a reasonable starting point here as well.
+LATENT_GOAL_SIGREG_WEIGHT ?= 0.1
+
 # PEFT (LoRA) — when true, LoRA adapters land on the frozen SmolVLM2
 # text_model q/v_proj. The action expert, the Latent Goal Expert (when
 # on), and all small projections stay fully trainable via
@@ -104,6 +119,7 @@ LORA_R           ?= 16
 # default — flip to true for the LGE-conditioned-action ablation. Pair
 # with LEWM_INJECT_TO=none to isolate the LGE pathway.
 LATENT_GOAL_INJECT_TO_ACTION ?= true
+
 # Source of z_g going into the action expert during *training*:
 #   "encoded"   — frozen le-wm CLS of the chunk-end frame from the dataset.
 #                 Train-only; eval still uses LGE's denoised prediction.
@@ -113,14 +129,26 @@ LATENT_GOAL_INJECT_TO_ACTION ?= true
 #                 step 0 to predicted (student) at LATENT_GOAL_INJECT_SCHEDULE_END_STEP.
 #                 Closes the train/eval gap gradually.
 LATENT_GOAL_INJECT_Z_G_SOURCE ?= scheduled
+
+# Step at which the "scheduled" source *starts* the linear ramp (p=0
+# before this, then ramps from 0 → 1 by LATENT_GOAL_INJECT_SCHEDULE_END_STEP).
+# Default 0 = ramp from the very beginning of training. Set > 0 to keep
+# the action expert on the clean encoded teacher signal until LGE has
+# had time to fit, then start blending in predicted z_g. Must be
+# < LATENT_GOAL_INJECT_SCHEDULE_END_STEP. Ignored unless source=scheduled.
+LATENT_GOAL_INJECT_SCHEDULE_START_STEP ?= $(shell expr $(STEPS) / 2)
+
 # Step at which the "scheduled" source reaches 100% predicted (linear
-# ramp from step 0). Default = STEPS so the schedule completes exactly
-# at the end of training. Ignored unless source=scheduled.
+# ramp from LATENT_GOAL_INJECT_SCHEDULE_START_STEP). Default = STEPS so
+# the schedule completes exactly at the end of training. Ignored unless
+# source=scheduled.
 LATENT_GOAL_INJECT_SCHEDULE_END_STEP ?= $(STEPS)
+
 # Detach z_g (and z_t) before the action expert reads them. True =
 # paper-faithful KI-style barrier (action loss cannot reshape LGE).
 # False = differentiable conditioning (LGE also adapts to action loss).
 LATENT_GOAL_INJECT_DETACH ?= true
+
 # LGE denoising steps used to produce z_g for the action expert during
 # training (Mode 3, source=predicted). 1 = current one-step closed-form
 # reconstruction. Set to LATENT_GOAL_NUM_STEPS (10 by default) to match
@@ -129,16 +157,48 @@ LATENT_GOAL_INJECT_DETACH ?= true
 LATENT_GOAL_TRAIN_NUM_STEPS ?= 10
 
 # ── Phase B / MPC inference (eval-only) ──────────────────────────────
+
 # Activates the le-wm predictor rollout + LGE-z_g scoring on top of the
 # policy's anchor chunk at inference. All values are runtime knobs read
 # by the eval-mpc target; never used by train.
 MPC                ?= false
-MPC_SCHEME         ?= anchor_perturb  # anchor_perturb | cem
+MPC_SCHEME         ?= anchor_perturb  # anchor_perturb | cem | mppi
 MPC_NUM_CANDIDATES ?= 16
 MPC_NOISE_SCALE    ?= 0.1
 MPC_CEM_NUM_ITER   ?= 4
 MPC_CEM_TOPK       ?= 4
 MPC_CEM_BLEND      ?= 0.5
+
+# CEM variant knobs (scheme=cem only). Mirror le-wm's reference
+# CEMSolver semantics. Defaults are the AI-CEM variant (anchor as slot
+# 0 every iter, μ_0 = anchor, return best-ever) — preserves prior
+# behavior. Set INCLUDE_ANCHOR=false + INIT_MEAN=zero + RETURN=final_mean
+# for the pure le-wm reference. Each knob is orthogonal — pick any combo.
+MPC_CEM_INCLUDE_ANCHOR ?= true
+MPC_CEM_INIT_MEAN      ?= anchor   # anchor | zero
+MPC_CEM_RETURN         ?= best_ever # best_ever | final_mean
+
+# MPPI knobs (scheme=mppi only). Temperature β controls softmax
+# sharpness: β→0 = hard argmin, β→∞ = uniform mean. Tune against the
+# cost scale (sum-of-squares L2 in 192-d projector space).
+MPC_MPPI_TEMP      ?= 1.0
+# Default M=4 matches CEM's iteration count and total predictor rollouts
+# (N·M=64). MPPI-vs-CEM at fixed compute. M=1 = vanilla single-shot.
+MPC_MPPI_NUM_ITER  ?= 4
+# Score-floor escape (all schemes). Return anchor unchanged unless the
+# chosen candidate's predictor cost beats anchor by this relative margin.
+# 0.0 = off (legacy behavior); 0.05 = require ≥ 5% relative improvement
+# before deviating. Caps MPC's downside on near-perfect anchors at zero
+# loss — addresses the strong-anchor regression failure mode.
+MPC_SCORE_FLOOR_MARGIN ?= 0.15
+
+# iCEM colored-noise exponent for action-chunk perturbations (all
+# schemes). β=0 (default) = white Gaussian noise, legacy behavior.
+# β=1 = pink, mild temporal correlation. β=2 = red/Brownian, the
+# iCEM default (Pinneri et al. 2020) — slow drifts that keep
+# candidates closer to the manifold of real trajectories the le-wm
+# predictor was trained on.
+MPC_ICEM_BETA      ?= 2.0
 
 TRAIN_LAUNCHER  = $(if $(filter-out 1,$(NUM_GPUS)),accelerate launch --multi_gpu --num_processes=$(NUM_GPUS) --mixed_precision=$(MIXED_PRECISION) -m lerobot.scripts.lerobot_train,lerobot-train)
 DOCKER_CUDA_ENV = $(if $(filter-out 1,$(NUM_GPUS)),-e CUDA_VISIBLE_DEVICES=$(shell python3 -c "print(','.join(str(i) for i in range($(NUM_GPUS))))"),)
@@ -157,7 +217,7 @@ DOCKER_RUN = docker run $(if $(GPU),--gpus device=$(GPU) -e MUJOCO_EGL_DEVICE_ID
 	  -v $(LIBERO_CACHE_DIR):/home/user_lerobot/.cache/libero \
 	  -v $(LEWM_HOST_DIR):/lewm:ro \
 	  -v $(LEWM_SRC_DIR):/lewm-src:ro \
-	  -v $(CURDIR)/outputs:/lerobot/outputs \
+	  -v $(OUTPUTS_HOST_DIR):$(OUTPUTS_HOST_DIR) \
 	  -v $(CURDIR)/src:/lerobot/src \
 	  -e MUJOCO_GL=egl \
 	  -e HF_DATASETS_CACHE=/tmp/hf-datasets \
@@ -192,8 +252,10 @@ train:
 	  --policy.lewm_inject_to=$(LEWM_INJECT_TO) \
 	  --policy.latent_goal_enabled=$(LATENT_GOAL) \
 	  --policy.latent_goal_loss_weight=$(LATENT_GOAL_LOSS_WEIGHT) \
+	  --policy.latent_goal_sigreg_weight=$(LATENT_GOAL_SIGREG_WEIGHT) \
 	  --policy.latent_goal_inject_to_action=$(LATENT_GOAL_INJECT_TO_ACTION) \
 	  --policy.latent_goal_inject_z_g_source=$(LATENT_GOAL_INJECT_Z_G_SOURCE) \
+	  --policy.latent_goal_inject_schedule_start_step=$(LATENT_GOAL_INJECT_SCHEDULE_START_STEP) \
 	  --policy.latent_goal_inject_schedule_end_step=$(LATENT_GOAL_INJECT_SCHEDULE_END_STEP) \
 	  --policy.latent_goal_inject_detach=$(LATENT_GOAL_INJECT_DETACH) \
 	  --policy.latent_goal_train_num_steps=$(LATENT_GOAL_TRAIN_NUM_STEPS) \
@@ -237,6 +299,13 @@ eval-mpc:
 	  --policy.mpc_cem_num_iter=$(MPC_CEM_NUM_ITER) \
 	  --policy.mpc_cem_topk=$(MPC_CEM_TOPK) \
 	  --policy.mpc_cem_anchor_blend=$(MPC_CEM_BLEND) \
+	  --policy.mpc_cem_include_anchor=$(MPC_CEM_INCLUDE_ANCHOR) \
+	  --policy.mpc_cem_init_mean=$(MPC_CEM_INIT_MEAN) \
+	  --policy.mpc_cem_return=$(MPC_CEM_RETURN) \
+	  --policy.mpc_mppi_temperature=$(MPC_MPPI_TEMP) \
+	  --policy.mpc_mppi_num_iter=$(MPC_MPPI_NUM_ITER) \
+	  --policy.mpc_score_floor_margin=$(MPC_SCORE_FLOOR_MARGIN) \
+	  --policy.mpc_icem_beta=$(MPC_ICEM_BETA) \
 	  --policy.mpc_predictor_path=/lewm/$(LEWM_CKPT_NAME) \
 	  --env.type=libero \
 	  --env.task=$(EVAL_TASKS) \
@@ -244,7 +313,7 @@ eval-mpc:
 	  --eval.batch_size=$(EVAL_BATCH) \
 	  --env.max_parallel_tasks=$(EVAL_PARALLEL)
 
-TABLE_RUN      ?= $(shell ls -td outputs/eval/*/* 2>/dev/null | head -1)
+TABLE_RUN      ?= $(shell ls -td $(OUTPUTS_HOST_DIR)/eval/*/* 2>/dev/null | head -1)
 TABLE_LABEL    ?= Policy
 
 table:

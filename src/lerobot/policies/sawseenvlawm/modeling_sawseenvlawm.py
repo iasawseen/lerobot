@@ -216,6 +216,43 @@ def aloha_gripper_from_angular_inv(value):
     return normalize(value, min_val=0.4, max_val=1.5)
 
 
+class SIGReg(nn.Module):
+    """Sketch Isotropic Gaussian Regularizer (le-wm/module.py:SIGReg).
+
+    Evaluates the Epps-Pulley test statistic on ``num_proj`` random 1-D
+    projections of the input, integrated against a Gaussian kernel at
+    ``knots`` knots in [0, 3]. Pulls the input's marginals toward an
+    isotropic Gaussian. In le-wm this prevents JEPA encoder collapse; here
+    it's an optional regularizer on the LGE's reconstructed clean
+    prediction ``z_g_pred``.
+
+    Single-GPU statistic — under DDP each rank computes it on its own
+    batch shard, which weakens the signal but is otherwise fine.
+    """
+
+    def __init__(self, knots: int = 17, num_proj: int = 1024):
+        super().__init__()
+        self.num_proj = num_proj
+        t = torch.linspace(0, 3, knots, dtype=torch.float32)
+        dt = 3 / (knots - 1)
+        weights = torch.full((knots,), 2 * dt, dtype=torch.float32)
+        weights[[0, -1]] = dt
+        window = torch.exp(-t.square() / 2.0)
+        self.register_buffer("t", t)
+        self.register_buffer("phi", window)
+        self.register_buffer("weights", weights * window)
+
+    def forward(self, proj: torch.Tensor) -> torch.Tensor:
+        """``proj`` of shape (T, B, D); LGE callers pass (1, B, 192)."""
+        proj = proj.to(self.t.dtype)
+        A = torch.randn(proj.size(-1), self.num_proj, device=proj.device, dtype=proj.dtype)
+        A = A.div_(A.norm(p=2, dim=0))
+        x_t = (proj @ A).unsqueeze(-1) * self.t
+        err = (x_t.cos().mean(-3) - self.phi).square() + x_t.sin().mean(-3).square()
+        statistic = (err @ self.weights) * proj.size(-2)
+        return statistic.mean()
+
+
 class SawSeenVLAWMPolicy(PreTrainedPolicy):
     """Wrapper class around VLAFlowMatching model to train and run inference within LeRobot."""
 
@@ -388,7 +425,7 @@ class SawSeenVLAWMPolicy(PreTrainedPolicy):
         if self.config.latent_goal_enabled:
             chunk_end_images, chunk_end_pad_mask = self.prepare_chunk_end_images(batch)
 
-        losses, latent_goal_loss = self.model.forward(
+        losses, latent_goal_loss, latent_goal_sigreg_loss = self.model.forward(
             images, img_masks, lang_tokens, lang_masks, state, actions, noise, time,
             chunk_end_images=chunk_end_images,
             chunk_end_pad_mask=chunk_end_pad_mask,
@@ -418,6 +455,12 @@ class SawSeenVLAWMPolicy(PreTrainedPolicy):
             if latent_goal_loss is not None:
                 per_sample_loss = per_sample_loss + self.config.latent_goal_loss_weight * latent_goal_loss
                 loss_dict["loss_latent_goal"] = latent_goal_loss.item()
+            if latent_goal_sigreg_loss is not None:
+                per_sample_loss = (
+                    per_sample_loss
+                    + self.config.latent_goal_sigreg_weight * latent_goal_sigreg_loss
+                )
+                loss_dict["loss_latent_goal_sigreg"] = latent_goal_sigreg_loss.item()
             loss_dict["loss"] = per_sample_loss.mean().item()
             return per_sample_loss, loss_dict
         else:
@@ -433,10 +476,16 @@ class SawSeenVLAWMPolicy(PreTrainedPolicy):
                 loss_dict["loss_latent_goal"] = latent_goal_loss.item()
             else:
                 loss = loss_action
+            if latent_goal_sigreg_loss is not None:
+                loss = loss + self.config.latent_goal_sigreg_weight * latent_goal_sigreg_loss
+                loss_dict["loss_latent_goal_sigreg"] = latent_goal_sigreg_loss.item()
             if self.config.latent_goal_inject_z_g_source == "scheduled":
                 step = int(self.model._train_step.item())
+                start = self.config.latent_goal_inject_schedule_start_step
                 end = self.config.latent_goal_inject_schedule_end_step
-                loss_dict["latent_goal_schedule_p"] = min(1.0, step / max(1, end))
+                loss_dict["latent_goal_schedule_p"] = min(
+                    1.0, max(0.0, (step - start) / (end - start))
+                )
             loss_dict["loss"] = loss.item()
             return loss, loss_dict
 
@@ -761,6 +810,15 @@ class VLAFlowMatching(nn.Module):
                 action_hidden = self.vlm_with_expert.expert_hidden_size
                 self.latent_goal_action_zt_proj = nn.Linear(latent_goal_latent_dim, action_hidden)
                 self.latent_goal_action_zg_proj = nn.Linear(latent_goal_latent_dim, action_hidden)
+
+        # Optional SIGReg regularizer on the LGE's reconstructed clean
+        # prediction (only built when both LGE is on and the weight > 0).
+        self.latent_goal_sigreg: SIGReg | None = None
+        if self.config.latent_goal_enabled and self.config.latent_goal_sigreg_weight > 0:
+            self.latent_goal_sigreg = SIGReg(
+                knots=self.config.latent_goal_sigreg_knots,
+                num_proj=self.config.latent_goal_sigreg_num_proj,
+            )
 
         # le-wm visual side-channel (frozen ViT-Tiny trained on Libero).
         # When ``lewm_encoder_path`` is set, le-wm tokens are prepended to
@@ -1183,6 +1241,7 @@ class VLAFlowMatching(nn.Module):
         )
 
         latent_goal_loss: torch.Tensor | None = None
+        latent_goal_sigreg_loss: torch.Tensor | None = None
         prefix_len = prefix_pad_masks.shape[1]
 
         if self.config.latent_goal_enabled and self.config.latent_goal_inject_to_action:
@@ -1258,6 +1317,25 @@ class VLAFlowMatching(nn.Module):
             else:
                 latent_goal_loss = per_sample_fs.mean()
 
+            # ── SIGReg on the gradient-connected one-step reconstruction ──
+            # Independent of the Mode 3 ``source`` switch: SIGReg regularizes
+            # LGE's output distribution, not the action expert's conditioning
+            # input. Padded chunk-end samples are dropped to avoid pulling
+            # the marginals toward the padding distribution.
+            if self.latent_goal_sigreg is not None:
+                z_g_pred_for_sigreg = (
+                    latent_goal_x_t.to(dtype=torch.float32)
+                    - latent_goal_t_exp.to(dtype=torch.float32) * latent_goal_v
+                )
+                if chunk_end_pad_mask is not None:
+                    keep = ~chunk_end_pad_mask
+                    if keep.any():
+                        z_g_pred_for_sigreg = z_g_pred_for_sigreg[keep]
+                if z_g_pred_for_sigreg.shape[0] > 0:
+                    latent_goal_sigreg_loss = self.latent_goal_sigreg(
+                        z_g_pred_for_sigreg.unsqueeze(0)
+                    )
+
             # ── Build z_g for the action expert ──
             source = self.config.latent_goal_inject_z_g_source
             if source == "encoded":
@@ -1290,11 +1368,14 @@ class VLAFlowMatching(nn.Module):
 
                 if source == "scheduled":
                     # Per-sample Bernoulli mix:
-                    #   p = clamp(step / end_step, 0, 1)
+                    #   p = clamp((step - start_step) / (end_step - start_step), 0, 1)
                     # mask=1 → use predicted (student); mask=0 → encoded (teacher).
+                    # Validation enforces 0 <= start_step < end_step, so
+                    # the denominator is always positive.
                     step = int(self._train_step.item())
+                    start = self.config.latent_goal_inject_schedule_start_step
                     end = self.config.latent_goal_inject_schedule_end_step
-                    p = min(1.0, step / max(1, end))
+                    p = min(1.0, max(0.0, (step - start) / (end - start)))
                     bsize = z_g_target.shape[0]
                     u = torch.rand(bsize, device=z_g_target.device)
                     use_predicted = (u < p).to(dtype=z_g_target.dtype).unsqueeze(-1)  # (B, 1)
@@ -1409,6 +1490,23 @@ class VLAFlowMatching(nn.Module):
             else:
                 latent_goal_loss = per_sample_fs.mean()
 
+            # ── SIGReg on the gradient-connected one-step reconstruction ──
+            # Same regularizer as in Mode 3 (drop padded chunk-ends so the
+            # marginals aren't pulled toward the padding distribution).
+            if self.latent_goal_sigreg is not None:
+                z_g_pred_for_sigreg = (
+                    latent_goal_x_t.to(dtype=torch.float32)
+                    - latent_goal_t_exp.to(dtype=torch.float32) * latent_goal_v
+                )
+                if chunk_end_pad_mask is not None:
+                    keep = ~chunk_end_pad_mask
+                    if keep.any():
+                        z_g_pred_for_sigreg = z_g_pred_for_sigreg[keep]
+                if z_g_pred_for_sigreg.shape[0] > 0:
+                    latent_goal_sigreg_loss = self.latent_goal_sigreg(
+                        z_g_pred_for_sigreg.unsqueeze(0)
+                    )
+
         else:
             suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(
                 x_t, time, suffix_lewm
@@ -1430,7 +1528,7 @@ class VLAFlowMatching(nn.Module):
             suffix_out = suffix_out.to(dtype=torch.float32)
             v_t = self.action_out_proj(suffix_out)
             losses = F.mse_loss(u_t, v_t, reduction="none")
-        return losses, latent_goal_loss
+        return losses, latent_goal_loss, latent_goal_sigreg_loss
 
     def _build_inference_context(
         self,
@@ -1629,11 +1727,36 @@ class VLAFlowMatching(nn.Module):
         # (2) Scoring-space latents.
         z_t_emb, z_g_emb = self._build_mpc_targets(ctx)
 
-        # (3) Pick candidates per scheme.
+        # (3) Pick candidates per scheme. Each returns the per-batch
+        # best actions plus the anchor's and chosen candidate's costs,
+        # so the score-floor gate below can compare them.
         if self.config.mpc_scheme == "cem":
-            best_raw = self._cem_search(z_t_emb, z_g_emb, anchor)
+            best_raw, anchor_cost, best_cost = self._cem_search(
+                z_t_emb, z_g_emb, anchor
+            )
+        elif self.config.mpc_scheme == "mppi":
+            best_raw, anchor_cost, best_cost = self._mppi_search(
+                z_t_emb, z_g_emb, anchor
+            )
         else:
-            best_raw = self._anchor_perturb_search(z_t_emb, z_g_emb, anchor)
+            best_raw, anchor_cost, best_cost = self._anchor_perturb_search(
+                z_t_emb, z_g_emb, anchor
+            )
+
+        # (3b) Score-floor escape: deviate from the anchor only when the
+        # relative improvement clears ``mpc_score_floor_margin``.
+        #   keep_anchor_b = (anchor_cost − best_cost) / anchor_cost < margin
+        # Caps MPC's downside at the anchor's actions on flat / noisy
+        # cost surfaces where the predictor's argmin is unreliable. Per
+        # batch element — each chunk decision in the eval batch is
+        # gated independently.
+        margin = self.config.mpc_score_floor_margin
+        if margin > 0:
+            safe_anchor_cost = anchor_cost.clamp_min(1e-8)
+            relative_improvement = (anchor_cost - best_cost) / safe_anchor_cost
+            keep_anchor = relative_improvement < margin  # (B,)
+            keep_anchor_mask = keep_anchor.view(-1, 1, 1).expand_as(best_raw)
+            best_raw = torch.where(keep_anchor_mask, anchor, best_raw)
 
         # (4) Re-pad to max_action_dim. The trailing pad slots stay zero
         #     to match what the action expert would emit there.
@@ -1655,20 +1778,70 @@ class VLAFlowMatching(nn.Module):
         )
         return z_t_emb.to(torch.float32), z_g_emb.to(torch.float32)
 
+    def _perturbation_noise(
+        self,
+        B: int,
+        N: int,
+        T: int,
+        A: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tensor:
+        """Sample candidate perturbations of shape (B, N, T, A).
+
+        β=0 (default) is white Gaussian noise — ``torch.randn``, the
+        legacy behavior. β>0 switches to colored noise with PSD ∝ 1/f^β
+        along the time axis (iCEM, Pinneri et al. 2020):
+          * β=1 — pink, mild temporal correlation.
+          * β=2 — red/Brownian, strong slow drifts (iCEM default).
+
+        Motivation: the le-wm predictor was trained on real action
+        trajectories, which are temporally smooth. White-noise
+        perturbations push candidates off the training manifold, and
+        the predictor's cost ranking degenerates into noise. Colored
+        perturbations stay closer to the manifold and the topk elite
+        selection becomes meaningful again.
+
+        Each (B, N, A) trajectory is rescaled to unit std along T so
+        the σ semantics from ``mpc_noise_scale`` are preserved across β.
+        FFT is done in fp32 for stability and cast back to ``dtype``.
+        """
+        beta = self.config.mpc_icem_beta
+        if beta == 0 or T <= 2:
+            return torch.randn(B, N, T, A, device=device, dtype=dtype)
+
+        work_dtype = torch.float32
+        freqs = torch.fft.rfftfreq(T, device=device, dtype=work_dtype)
+        n_freqs = freqs.shape[0]
+        # Low-frequency cutoff at f_min = 1/T avoids div-by-zero at DC
+        # and keeps integrated power finite for β > 1.
+        f_safe = freqs.clamp_min(1.0 / T)
+        s_scale = f_safe ** (-beta / 2.0)  # (n_freqs,)
+
+        real = torch.randn(B, N, n_freqs, A, device=device, dtype=work_dtype)
+        imag = torch.randn(B, N, n_freqs, A, device=device, dtype=work_dtype)
+        s_scale_b = s_scale.view(1, 1, n_freqs, 1)
+        spectrum = torch.complex(real * s_scale_b, imag * s_scale_b)
+        noise = torch.fft.irfft(spectrum, n=T, dim=2)  # (B, N, T, A)
+
+        std = noise.std(dim=2, keepdim=True).clamp_min(1e-8)
+        return (noise / std).to(dtype)
+
     def _anchor_perturb_search(
         self,
         z_t_emb: Tensor,
         z_g_emb: Tensor,
         anchor: Tensor,
-    ) -> Tensor:
-        """Scheme A. Returns best candidate per batch element: (B, T, A_raw)."""
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Scheme A. Returns (best_actions, anchor_cost, best_cost)."""
         B, T, A = anchor.shape
         N = self.config.mpc_num_candidates
         sigma = self.config.mpc_noise_scale
         device = anchor.device
+        batch_idx = torch.arange(B, device=device)
 
         # Candidate 0 = anchor; rest = anchor + sigma * eps.
-        eps = torch.randn(B, N - 1, T, A, device=device, dtype=anchor.dtype)
+        eps = self._perturbation_noise(B, N - 1, T, A, device, anchor.dtype)
         candidates = torch.cat(
             [anchor.unsqueeze(1), anchor.unsqueeze(1) + sigma * eps],
             dim=1,
@@ -1676,21 +1849,156 @@ class VLAFlowMatching(nn.Module):
 
         cost = self._lewm_rollout_score(z_t_emb, z_g_emb, candidates)  # (B, N)
         best = cost.argmin(dim=1)  # (B,)
-        return candidates[torch.arange(B, device=device), best]
+        best_actions = candidates[batch_idx, best]
+        return best_actions, cost[:, 0], cost[batch_idx, best]
 
     def _cem_search(
         self,
         z_t_emb: Tensor,
         z_g_emb: Tensor,
         anchor: Tensor,
-    ) -> Tensor:
-        """Scheme B. CEM over Gaussian perturbations centered on the anchor."""
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Scheme B. CEM over Gaussian perturbations.
+
+        Three orthogonal variant knobs:
+
+        * ``mpc_cem_init_mean`` — what μ_0 is.
+            - "anchor" (default): μ_0 = policy's flow-matched chunk.
+              The policy prior seeds the search.
+            - "zero": μ_0 = zeros. Le-wm's reference (``init_action=None``
+              path in ``stable_worldmodel.solver.CEMSolver.init_action_distrib``).
+              Ignores the policy entirely.
+
+        * ``mpc_cem_include_anchor`` — what occupies candidate slot 0
+          every iter.
+            - True (default, the AI-CEM variant): anchor at slot 0.
+              Anchor is always evaluated; the topk pool can self-anchor
+              μ when the anchor is strong.
+            - False: current μ at slot 0 (le-wm's reference; line 155 of
+              swm CEMSolver). Anchor never enters the optimization —
+              search is unbiased by the policy prior.
+
+        * ``mpc_cem_return`` — what to return.
+            - "best_ever" (default): lowest-cost candidate seen across
+              all iters. Safer when M is small and σ may not have
+              converged.
+            - "final_mean": the converged μ from the last iter (le-wm
+              reference). Relies on σ-shrinkage to make μ a meaningful
+              elite consensus.
+
+        Returns ``(best_actions, anchor_cost, best_cost)`` so the
+        score-floor gate in ``_mpc_sample_actions`` can decide whether
+        the per-batch improvement is large enough to deviate from the
+        anchor. ``anchor_cost`` is always computed (one extra rollout)
+        so the gate works regardless of whether the anchor entered the
+        optimization.
+        """
         B, T, A = anchor.shape
         N = self.config.mpc_num_candidates
         sigma_init = self.config.mpc_noise_scale
         blend = self.config.mpc_cem_anchor_blend
         topk = self.config.mpc_cem_topk
         num_iter = self.config.mpc_cem_num_iter
+        include_anchor = self.config.mpc_cem_include_anchor
+        init_mean = self.config.mpc_cem_init_mean
+        return_kind = self.config.mpc_cem_return
+        device = anchor.device
+        dtype = anchor.dtype
+        batch_idx = torch.arange(B, device=device)
+
+        if init_mean == "zero":
+            mu = torch.zeros_like(anchor)
+        else:  # "anchor"
+            mu = anchor.clone()
+        sigma = torch.full_like(anchor, sigma_init)
+
+        # Anchor always scored once for the score-floor gate (cheap; one
+        # rollout). When include_anchor=True it is also reused as
+        # candidate 0 of every iter; when False the gate uses it but the
+        # search ignores it.
+        anchor_cost = self._lewm_rollout_score(z_t_emb, z_g_emb, anchor.unsqueeze(1)).squeeze(1)
+        best_cost = anchor_cost.clone()
+        best_actions = anchor.clone()
+        anchor_expanded = anchor.unsqueeze(1) if include_anchor else None
+
+        for _ in range(num_iter):
+            eps = self._perturbation_noise(B, N - 1, T, A, device, dtype)
+            perturbed = mu.unsqueeze(1) + sigma.unsqueeze(1) * eps  # (B, N-1, T, A)
+
+            if include_anchor:
+                # AI-CEM: slot 0 = anchor (cached cost), slots 1..N-1
+                # are fresh perturbations. Saves one rollout per iter.
+                candidates = torch.cat([anchor_expanded, perturbed], dim=1)  # (B, N, T, A)
+                perturbed_cost = self._lewm_rollout_score(z_t_emb, z_g_emb, perturbed)  # (B, N-1)
+                cost = torch.cat([anchor_cost.unsqueeze(1), perturbed_cost], dim=1)  # (B, N)
+            else:
+                # Le-wm reference: slot 0 = current μ, slots 1..N-1 are
+                # fresh perturbations. μ is re-scored every iter (it
+                # evolves with the elite refit).
+                candidates = torch.cat([mu.unsqueeze(1), perturbed], dim=1)  # (B, N, T, A)
+                cost = self._lewm_rollout_score(z_t_emb, z_g_emb, candidates)  # (B, N)
+
+            elite_idx = cost.topk(topk, dim=1, largest=False).indices  # (B, K)
+            elite = candidates[batch_idx[:, None], elite_idx]  # (B, K, T, A)
+            mu = elite.mean(dim=1)
+            sigma_new = elite.std(dim=1)
+            sigma = sigma_new * (1 - blend) + sigma_init * blend
+
+            if return_kind == "best_ever":
+                iter_best = cost.argmin(dim=1)
+                iter_cost = cost[batch_idx, iter_best]
+                iter_actions = candidates[batch_idx, iter_best]
+                improved = iter_cost < best_cost
+                best_cost = torch.where(improved, iter_cost, best_cost)
+                improved_mask = improved.view(B, 1, 1).expand_as(best_actions)
+                best_actions = torch.where(improved_mask, iter_actions, best_actions)
+
+        if return_kind == "final_mean":
+            # Le-wm reference: return the converged μ. Score it once so
+            # the score-floor gate has a meaningful best_cost to compare
+            # against anchor_cost.
+            final_mu_cost = self._lewm_rollout_score(z_t_emb, z_g_emb, mu.unsqueeze(1)).squeeze(1)
+            return mu, anchor_cost, final_mu_cost
+
+        return best_actions, anchor_cost, best_cost
+
+    def _mppi_search(
+        self,
+        z_t_emb: Tensor,
+        z_g_emb: Tensor,
+        anchor: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Scheme C. MPPI: cost-weighted softmax aggregation.
+
+        Like CEM in that we sample Gaussian candidates around a center
+        and update the center from their costs, but the update is a
+        softmax-weighted mean (every candidate contributes proportionally
+        to ``exp(−cost / β)``) rather than a hard top-K elite refit. More
+        robust to score noise — no information thrown away.
+
+        Anchor-included (same guarantee as `_cem_search`): anchor at
+        slot 0 every iter, scored once. The softmax mean ``mu`` is also
+        evaluated and added to the best-ever pool so the MPPI "consensus"
+        action can win on its own merits without being scored as a side
+        effect of the loop.
+
+        Vanilla MPPI is single-shot (``mpc_mppi_num_iter=1``): one
+        Gaussian batch around the anchor, softmax-aggregate, evaluate
+        ``mu`` once, return the best of {anchor, argmin candidate,
+        ``mu``}. ``num_iter > 1`` re-samples around the updated ``mu``
+        for refinement at M× predictor rollouts cost.
+
+        σ is held fixed at ``mpc_noise_scale`` across iters — MPPI has
+        no σ-shrinkage analogue to CEM's elite std refit. Temporal
+        smoothness of perturbations is governed by ``mpc_icem_beta``
+        (see ``_perturbation_noise``); β>0 turns this into MPPI on
+        colored noise.
+        """
+        B, T, A = anchor.shape
+        N = self.config.mpc_num_candidates
+        sigma_init = self.config.mpc_noise_scale
+        beta = self.config.mpc_mppi_temperature
+        num_iter = self.config.mpc_mppi_num_iter
         device = anchor.device
         dtype = anchor.dtype
         batch_idx = torch.arange(B, device=device)
@@ -1698,22 +2006,24 @@ class VLAFlowMatching(nn.Module):
         mu = anchor.clone()  # (B, T, A)
         sigma = torch.full_like(anchor, sigma_init)
 
-        # Track the best candidate ever seen, in case later CEM iters
-        # drift to a worse region.
         anchor_cost = self._lewm_rollout_score(z_t_emb, z_g_emb, anchor.unsqueeze(1)).squeeze(1)
         best_cost = anchor_cost
         best_actions = anchor.clone()
+        anchor_expanded = anchor.unsqueeze(1)
 
         for _ in range(num_iter):
-            eps = torch.randn(B, N, T, A, device=device, dtype=dtype)
-            candidates = mu.unsqueeze(1) + sigma.unsqueeze(1) * eps  # (B, N, T, A)
-            cost = self._lewm_rollout_score(z_t_emb, z_g_emb, candidates)  # (B, N)
+            eps = self._perturbation_noise(B, N - 1, T, A, device, dtype)
+            perturbed = mu.unsqueeze(1) + sigma.unsqueeze(1) * eps  # (B, N-1, T, A)
+            candidates = torch.cat([anchor_expanded, perturbed], dim=1)  # (B, N, T, A)
 
-            elite_idx = cost.topk(topk, dim=1, largest=False).indices  # (B, K)
-            elite = candidates[batch_idx[:, None], elite_idx]  # (B, K, T, A)
-            mu = elite.mean(dim=1)
-            sigma_new = elite.std(dim=1)
-            sigma = sigma_new * (1 - blend) + sigma_init * blend
+            perturbed_cost = self._lewm_rollout_score(z_t_emb, z_g_emb, perturbed)
+            cost = torch.cat([anchor_cost.unsqueeze(1), perturbed_cost], dim=1)  # (B, N)
+
+            # Numerically-stable softmax: subtract per-batch min so the
+            # exponent stays bounded even when costs are large.
+            cost_shifted = cost - cost.min(dim=1, keepdim=True).values
+            weights = torch.softmax(-cost_shifted / beta, dim=1)  # (B, N)
+            mu = (weights.unsqueeze(-1).unsqueeze(-1) * candidates).sum(dim=1)  # (B, T, A)
 
             iter_best = cost.argmin(dim=1)
             iter_cost = cost[batch_idx, iter_best]
@@ -1723,7 +2033,17 @@ class VLAFlowMatching(nn.Module):
             improved_mask = improved.view(B, 1, 1).expand_as(best_actions)
             best_actions = torch.where(improved_mask, iter_actions, best_actions)
 
-        return best_actions
+        # Score the final softmax-weighted mean and include it in the
+        # best-ever pool. This is the "MPPI consensus" action — often
+        # smoother than any single noisy candidate and can outperform
+        # the per-iter argmin when the cost surface is locally convex.
+        mu_cost = self._lewm_rollout_score(z_t_emb, z_g_emb, mu.unsqueeze(1)).squeeze(1)
+        improved = mu_cost < best_cost
+        best_cost = torch.where(improved, mu_cost, best_cost)
+        improved_mask = improved.view(B, 1, 1).expand_as(best_actions)
+        best_actions = torch.where(improved_mask, mu, best_actions)
+
+        return best_actions, anchor_cost, best_cost
 
     def _lewm_rollout_score(
         self,
