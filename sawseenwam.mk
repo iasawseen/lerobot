@@ -98,6 +98,12 @@ LATENT_GOAL_INJECT_SCHEDULE_END_STEP ?= $(STEPS)
 LATENT_GOAL_INJECT_DETACH ?= true
 LATENT_GOAL_TRAIN_NUM_STEPS ?= 10
 
+# LGE target offset — frame at +N from the anchor is the LGE z_g target.
+# Decoupled from chunk_size in SawSeenWAM so the LGE supervision aligns
+# with the new lewm predictor's max k_tail (25 in the latest checkpoint).
+# Set to 0 / empty to fall back to chunk_size (legacy behavior).
+LATENT_GOAL_TARGET_OFFSET ?= 25
+
 # ── Phase B / MPC inference (eval-only) ──────────────────────────────
 MPC                ?= false
 MPC_SCHEME         ?= anchor_perturb  # anchor_perturb | cem | mppi
@@ -126,12 +132,15 @@ MPC_HORIZON_MODE   ?= single
 # Comma-separated k_tail offsets. Each must be in the checkpoint's
 # trained k_choices. Max value must be ≤ chunk_size (the longest
 # offset slot needs that many candidate actions).
-MPC_OFFSETS        ?= '(50,)'
+# The latest new-lewm checkpoint trains with k_choices=(1,2,5,10,25),
+# so MPC_OFFSETS values must be ⊆ that set. (25,) is the largest
+# single-offset; mixed e.g. (10,25) gives multi-horizon scoring.
+MPC_OFFSETS        ?= '(25,)'
 MPC_OFFSET_WEIGHTS ?= '(1.0,)'
-# Encoder's k_max — baked into the JEPA at training. New-lewm libero
-# defaults to k_choices=(1,2,4,8,16) so k_max=16; bump if your
-# checkpoint trained with a longer max k_tail.
-MPC_ACTION_K_MAX   ?= 16
+# Encoder's k_max — baked into the JEPA at training. Latest new-lewm
+# uses k_max=25 (k_choices=(1,2,5,10,25)); set to 16 if loading an
+# earlier checkpoint with k_choices=(1,2,4,8,16).
+MPC_ACTION_K_MAX   ?= 25
 
 TRAIN_LAUNCHER  = $(if $(filter-out 1,$(NUM_GPUS)),accelerate launch --multi_gpu --num_processes=$(NUM_GPUS) --mixed_precision=$(MIXED_PRECISION) -m lerobot.scripts.lerobot_train,lerobot-train)
 DOCKER_CUDA_ENV = $(if $(filter-out 1,$(NUM_GPUS)),-e CUDA_VISIBLE_DEVICES=$(shell python3 -c "print(','.join(str(i) for i in range($(NUM_GPUS))))"),)
@@ -193,6 +202,7 @@ train:
 	  --policy.latent_goal_inject_schedule_end_step=$(LATENT_GOAL_INJECT_SCHEDULE_END_STEP) \
 	  --policy.latent_goal_inject_detach=$(LATENT_GOAL_INJECT_DETACH) \
 	  --policy.latent_goal_train_num_steps=$(LATENT_GOAL_TRAIN_NUM_STEPS) \
+	  --policy.latent_goal_target_offset=$(LATENT_GOAL_TARGET_OFFSET) \
 	  --dataset.repo_id=$(DATASET_REPO) \
 	  --output_dir=$(OUTPUT_DIR) \
 	  --job_name=$(JOB_NAME) \

@@ -147,6 +147,28 @@ class SawSeenWAMConfig(PreTrainedConfig):
     latent_goal_expert_width_multiplier: float = 0.75
     latent_goal_num_expert_layers: int = -1
 
+    # ── LGE target offset (decoupled from chunk_size in SawSeenWAM) ──
+    # Frame offset at which LGE is supervised: the dataset returns
+    # ``image[t + latent_goal_target_offset]`` as the chunk-end frame
+    # and LGE regresses to its encoded latent. When None (default), the
+    # offset falls back to ``chunk_size`` — same behavior as SawSeenVLAWM.
+    #
+    # Set this when the new-lewm predictor's largest trained ``k_tail``
+    # is < ``chunk_size``. Aligns the LGE z_g target with what the
+    # predictor was actually trained to predict at, so MPC single-shot
+    # scoring at ``k_tail = latent_goal_target_offset`` is semantically
+    # meaningful (final-state MSE against the same horizon).
+    #
+    # Example: latest new-lewm checkpoint has k_choices=(1,2,5,10,25)
+    # and we keep chunk_size=50 (action expert still outputs 50-action
+    # chunks). Set ``latent_goal_target_offset=25`` so LGE supervises at
+    # +25 frames and ``mpc_offsets=(25,)`` cleanly aligns.
+    #
+    # Must satisfy ``0 < latent_goal_target_offset <= chunk_size`` (the
+    # candidate chunk needs at least this many actions to cover the
+    # horizon during AR rollout).
+    latent_goal_target_offset: int | None = None
+
     # ── Mode 3 LGE-conditioned action expert ─────────────────────────
     latent_goal_inject_to_action: bool = False
     latent_goal_inject_z_g_source: str = "encoded"
@@ -196,17 +218,26 @@ class SawSeenWAMConfig(PreTrainedConfig):
     # k_tail offsets used by ``multi_offset``. Must be a subset of the
     # checkpoint's trained ``k_choices``. The last (max) offset should
     # typically equal chunk_size for parity with the LGE z_g supervision.
-    mpc_offsets: tuple[int, ...] = (50,)
+    # ``mpc_offsets``: tuple of k_tail values. *Each must be in the
+    # checkpoint's trained ``k_choices``* — the action_encoder's k_emb
+    # has no entry for unseen k. Latest LIBERO k_choices = (1, 2, 5, 10,
+    # 25), so a multi-offset default of (25,) is the largest valid
+    # single-shot stride. Note semantic caveat: LGE supervises z_g at
+    # ``chunk_size=50`` ahead, but a k_tail=25 single-shot prediction is
+    # the JEPA's predicted state at +25 — *not* directly comparable to
+    # z_g at +50 unless the cost is interpreted as "directional progress
+    # at 25 steps". For chunk-end alignment, prefer ``"single"`` mode
+    # (AR k=1 for 50 steps) over ``"multi_offset"``.
+    mpc_offsets: tuple[int, ...] = (25,)
     # Weights for each offset (same length as ``mpc_offsets``). Higher
-    # weight = stronger contribution to the cost. Normalized to sum=1
-    # internally is *not* applied — raw weights flow through to the cost,
-    # so the user controls scale relative to other terms.
+    # weight = stronger contribution to the cost. Not normalized.
     mpc_offset_weights: tuple[float, ...] = (1.0,)
     # k_max baked into the new-lewm action_encoder. Must match the
     # checkpoint's encoder configuration (``encoder.k_max`` after
-    # unpickling). Default 16 matches the standard LIBERO multi-offset
-    # training (k_choices=(1,2,4,8,16)).
-    mpc_action_k_max: int = 16
+    # unpickling). Default 25 matches the latest LIBERO multi-offset
+    # training (k_choices=(1, 2, 5, 10, 25)). Earlier checkpoints used
+    # k_choices=(1, 2, 4, 8, 16) → bump down to 16 if loading those.
+    mpc_action_k_max: int = 25
 
     def __post_init__(self):
         super().__post_init__()
@@ -250,6 +281,17 @@ class SawSeenWAMConfig(PreTrainedConfig):
             )
         if self.latent_goal_train_num_steps < 1:
             raise ValueError("latent_goal_train_num_steps must be ≥ 1.")
+        if self.latent_goal_target_offset is not None:
+            if self.latent_goal_target_offset < 1:
+                raise ValueError(
+                    f"latent_goal_target_offset must be ≥ 1; got {self.latent_goal_target_offset}"
+                )
+            if self.latent_goal_target_offset > self.chunk_size:
+                raise ValueError(
+                    f"latent_goal_target_offset={self.latent_goal_target_offset} > "
+                    f"chunk_size={self.chunk_size} — the candidate action chunk would "
+                    f"not have enough actions to reach the target horizon."
+                )
         if self.latent_goal_sigreg_weight < 0:
             raise ValueError("latent_goal_sigreg_weight must be ≥ 0.")
         if self.latent_goal_sigreg_weight > 0 and not self.latent_goal_enabled:
@@ -357,9 +399,16 @@ class SawSeenWAMConfig(PreTrainedConfig):
         )
 
     @property
+    def latent_goal_offset(self) -> int:
+        """Resolved LGE target offset: explicit knob if set, else chunk_size."""
+        if self.latent_goal_target_offset is not None:
+            return self.latent_goal_target_offset
+        return self.chunk_size
+
+    @property
     def observation_delta_indices(self) -> list:
         if self.latent_goal_enabled:
-            return [0, self.chunk_size]
+            return [0, self.latent_goal_offset]
         return [0]
 
     @property

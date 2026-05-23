@@ -228,7 +228,13 @@ class WAMFlowMatching(VLAFlowMatching):
         z_g_emb: Tensor,
         candidates: Tensor,
     ) -> Tensor:
-        """AR rollout at k=1 for ``T=chunk_size`` steps, MSE to z_g.
+        """AR rollout at k=1 for ``T_rollout`` steps, MSE to z_g.
+
+        ``T_rollout = config.latent_goal_offset`` (= ``chunk_size`` when
+        ``latent_goal_target_offset`` is unset, for backward compat).
+        Candidates have T=chunk_size actions; we only use the first
+        T_rollout — the remaining tail isn't scored (and typically isn't
+        executed either since ``n_action_steps`` < ``chunk_size``).
 
         History fabrication: the new JEPA still uses history_size=3 by
         default. We have one real frame (z_t), so we repeat it HS times
@@ -237,10 +243,17 @@ class WAMFlowMatching(VLAFlowMatching):
         """
         assert self.lewm_world is not None
         B, N, T, A = candidates.shape
+        T_rollout = self.config.latent_goal_offset
+        if T_rollout > T:
+            raise RuntimeError(
+                f"latent_goal_offset={T_rollout} exceeds candidate chunk T={T}; "
+                "this should have been caught by config validation."
+            )
         HS = self.lewm_world.history_size
         device = candidates.device
         dtype = candidates.dtype
-        flat = candidates.reshape(B * N, T, A)
+        # Slice the first T_rollout actions from each candidate.
+        flat = candidates[:, :, :T_rollout, :].reshape(B * N, T_rollout, A)
 
         # Initial history embedding: repeat z_t HS times.
         z_t_flat = z_t_emb.repeat_interleave(N, dim=0)  # (B*N, D) or (B*N, K*D)
@@ -264,7 +277,7 @@ class WAMFlowMatching(VLAFlowMatching):
         # (HS-1 fabricated + 1 current) = HS slots into the action encoder.
         act_history = past_act  # (B*N, HS-1, A) → grows over the loop
 
-        for t in range(T):
+        for t in range(T_rollout):
             # Extend act_history with this step's action.
             act_step = flat[:, t : t + 1, :]  # (B*N, 1, A)
             act_history = torch.cat([act_history, act_step], dim=1)
