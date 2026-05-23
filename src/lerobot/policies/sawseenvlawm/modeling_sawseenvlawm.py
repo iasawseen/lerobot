@@ -827,28 +827,12 @@ class VLAFlowMatching(nn.Module):
         # action-expert injection — used by Latent Goal Expert to consume the
         # encoder's raw 192-dim features without contaminating the action
         # stream.
-        self.lewm_encoder: LeWMVisionEncoder | None = None
+        # Hook-pattern: subclasses (SawSeenWAM) override ``_load_lewm_encoder``
+        # and ``_load_lewm_world`` to swap in dual-encoder / new-JEPA
+        # variants without re-implementing this whole __init__.
+        self.lewm_encoder: nn.Module | None = None
         self.lewm_proj: nn.Linear | None = None
-        if self.config.lewm_encoder_path is not None:
-            if self.config.lewm_inject_to not in ("suffix", "none"):
-                raise ValueError(
-                    f"lewm_inject_to must be 'suffix' or 'none'; got {self.config.lewm_inject_to!r}"
-                )
-            self.lewm_encoder = LeWMVisionEncoder.from_lewm_checkpoint(
-                self.config.lewm_encoder_path,
-                num_tokens=self.config.lewm_num_tokens,
-                image_height=self.config.lewm_image_height,
-                image_width=self.config.lewm_image_width,
-                patch_size=self.config.lewm_patch_size,
-                freeze=self.config.lewm_freeze,
-            )
-            # Only build the action-expert projection when we're actually
-            # injecting tokens into the action expert. ``"none"`` leaves
-            # ``lewm_proj`` as None so ``compute_lewm_tokens`` returns None
-            # and the suffix path skips injection naturally.
-            if self.config.lewm_inject_to == "suffix":
-                proj_out = self.vlm_with_expert.expert_hidden_size
-                self.lewm_proj = nn.Linear(self.lewm_encoder.output_dim, proj_out)
+        self._load_lewm_encoder()
 
         if self.config.latent_goal_enabled and self.lewm_encoder is None:
             raise ValueError(
@@ -863,17 +847,8 @@ class VLAFlowMatching(nn.Module):
         # The pickle is the same as ``lewm_encoder_path`` (the encoder
         # we already loaded above is one of its sub-modules), so we can
         # fall back to that path when ``mpc_predictor_path`` is unset.
-        self.lewm_world: LeWMWorldModel | None = None
-        if self.config.mpc_enabled:
-            predictor_path = self.config.mpc_predictor_path or self.config.lewm_encoder_path
-            self.lewm_world = LeWMWorldModel.from_lewm_checkpoint(
-                predictor_path,
-                num_tokens=self.config.lewm_num_tokens,
-                image_height=self.config.lewm_image_height,
-                image_width=self.config.lewm_image_width,
-                patch_size=self.config.lewm_patch_size,
-                freeze=True,
-            )
+        self.lewm_world: nn.Module | None = None
+        self._load_lewm_world()
 
         self.set_requires_grad()
 
@@ -900,6 +875,50 @@ class VLAFlowMatching(nn.Module):
             torch.set_float32_matmul_precision("high")
             self.sample_actions = torch.compile(self.sample_actions, mode=config.compile_mode)
             self.forward = torch.compile(self.forward, mode=config.compile_mode)
+
+    def _load_lewm_encoder(self) -> None:
+        """Load the le-wm encoder + (optional) action-expert projection.
+
+        Default implementation loads the **old** single-encoder le-wm pickle
+        and concatenates cameras horizontally as a 224×448 image. Subclasses
+        (SawSeenWAM) override this to load the new dual-encoder JEPA and
+        encode the two cameras through separate ViTs.
+        """
+        if self.config.lewm_encoder_path is None:
+            return
+        if self.config.lewm_inject_to not in ("suffix", "none"):
+            raise ValueError(
+                f"lewm_inject_to must be 'suffix' or 'none'; got {self.config.lewm_inject_to!r}"
+            )
+        self.lewm_encoder = LeWMVisionEncoder.from_lewm_checkpoint(
+            self.config.lewm_encoder_path,
+            num_tokens=self.config.lewm_num_tokens,
+            image_height=self.config.lewm_image_height,
+            image_width=self.config.lewm_image_width,
+            patch_size=self.config.lewm_patch_size,
+            freeze=self.config.lewm_freeze,
+        )
+        if self.config.lewm_inject_to == "suffix":
+            proj_out = self.vlm_with_expert.expert_hidden_size
+            self.lewm_proj = nn.Linear(self.lewm_encoder.output_dim, proj_out)
+
+    def _load_lewm_world(self) -> None:
+        """Load the full le-wm JEPA for MPC inference.
+
+        Default: old single-encoder JEPA pickle. Subclasses override with
+        the new dual-encoder / variable-stride JEPA.
+        """
+        if not self.config.mpc_enabled:
+            return
+        predictor_path = self.config.mpc_predictor_path or self.config.lewm_encoder_path
+        self.lewm_world = LeWMWorldModel.from_lewm_checkpoint(
+            predictor_path,
+            num_tokens=self.config.lewm_num_tokens,
+            image_height=self.config.lewm_image_height,
+            image_width=self.config.lewm_image_width,
+            patch_size=self.config.lewm_patch_size,
+            freeze=True,
+        )
 
     def _rtc_enabled(self):
         return self.config.rtc_config is not None and self.config.rtc_config.enabled

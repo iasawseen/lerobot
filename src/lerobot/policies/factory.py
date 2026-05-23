@@ -55,6 +55,7 @@ from .sac.configuration_sac import SACConfig
 from .sawseenvla.configuration_sawseenvla import SawSeenVLAConfig
 from .sawseenvlaki.configuration_sawseenvlaki import SawSeenVLAKIConfig
 from .sawseenvlawm.configuration_sawseenvlawm import SawSeenVLAWMConfig
+from .sawseenwam.configuration_sawseenwam import SawSeenWAMConfig
 from .smolvla.configuration_smolvla import SmolVLAConfig
 from .tdmpc.configuration_tdmpc import TDMPCConfig
 from .utils import validate_visual_features_consistency
@@ -149,6 +150,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from .sawseenvlawm.modeling_sawseenvlawm import SawSeenVLAWMPolicy
 
         return SawSeenVLAWMPolicy
+    elif name == "sawseenwam":
+        from .sawseenwam.modeling_sawseenwam import SawSeenWAMPolicy
+
+        return SawSeenWAMPolicy
     elif name == "groot":
         from .groot.modeling_groot import GrootPolicy
 
@@ -211,6 +216,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return SawSeenVLAKIConfig(**kwargs)
     elif policy_type == "sawseenvlawm":
         return SawSeenVLAWMConfig(**kwargs)
+    elif policy_type == "sawseenwam":
+        return SawSeenWAMConfig(**kwargs)
     elif policy_type == "groot":
         return GrootConfig(**kwargs)
     elif policy_type == "xvla":
@@ -391,6 +398,19 @@ def make_pre_post_processors(
         from .smolvla.processor_smolvla import make_smolvla_pre_post_processors
 
         processors = make_smolvla_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
+    elif isinstance(policy_cfg, SawSeenWAMConfig):
+        # SawSeenWAMConfig subclasses are handled before SawSeenVLAWMConfig
+        # so isinstance() dispatch picks the right processor. (As written,
+        # SawSeenWAMConfig is not a subclass — both inherit PreTrainedConfig
+        # directly — but the ordering keeps the dispatcher robust if that
+        # changes.)
+        from .sawseenwam.processor_sawseenwam import make_sawseenwam_pre_post_processors
+
+        processors = make_sawseenwam_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )
