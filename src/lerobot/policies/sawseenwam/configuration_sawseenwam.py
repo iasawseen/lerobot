@@ -206,14 +206,24 @@ class SawSeenWAMConfig(PreTrainedConfig):
     # offset and the weighted-sum cost used.
     #
     # ``mpc_horizon_mode``:
-    #   "single"       — single AR rollout to chunk_size (T=chunk_size,
-    #                    k=1 step). Matches SawSeenVLAWM behavior.
-    #   "multi_offset" — for each k in ``mpc_offsets``, run a single-shot
-    #                    variable-stride prediction at k_tail=k from the
-    #                    history window, MSE against the same LGE z_g
-    #                    (z_g is supervised at chunk_size offset; for
-    #                    intermediate k, this measures "directional
-    #                    consistency"). Weighted sum gives the cost.
+    #   "single"       — *single-shot* var-stride prediction at
+    #                    k_tail = ``latent_goal_target_offset`` (= 25 by
+    #                    default). One ``predict()`` call per candidate;
+    #                    the candidate's first k_tail actions are packed
+    #                    into slot 2 of a 3-slot history (per-slot k =
+    #                    [1, 1, k_tail]). The predicted state at +k_tail
+    #                    is compared (MSE) to the LGE z_g (also at
+    #                    +k_tail). Requires k_tail ∈ checkpoint's
+    #                    trained k_choices. Recommended default.
+    #   "ar"           — Autoregressive rollout at k=1 for k_tail
+    #                    steps. ``predict()`` called k_tail times per
+    #                    candidate (much slower). Useful if the
+    #                    checkpoint wasn't trained at k=k_tail but
+    #                    *was* trained at k=1.
+    #   "multi_offset" — For each k in ``mpc_offsets``, run a
+    #                    single-shot var-stride prediction at k_tail=k,
+    #                    weighted-sum MSEs vs the same LGE z_g.
+    #                    Generalization of "single" to multiple offsets.
     mpc_horizon_mode: str = "single"
     # k_tail offsets used by ``multi_offset``. Must be a subset of the
     # checkpoint's trained ``k_choices``. The last (max) offset should
@@ -345,9 +355,9 @@ class SawSeenWAMConfig(PreTrainedConfig):
                 raise ValueError("mpc_score_floor_margin must be ≥ 0.")
             if self.mpc_icem_beta < 0:
                 raise ValueError("mpc_icem_beta must be ≥ 0.")
-            if self.mpc_horizon_mode not in ("single", "multi_offset"):
+            if self.mpc_horizon_mode not in ("single", "ar", "multi_offset"):
                 raise ValueError(
-                    f"mpc_horizon_mode must be 'single' or 'multi_offset'; got {self.mpc_horizon_mode!r}"
+                    f"mpc_horizon_mode must be 'single', 'ar', or 'multi_offset'; got {self.mpc_horizon_mode!r}"
                 )
             if self.mpc_horizon_mode == "multi_offset":
                 if len(self.mpc_offsets) != len(self.mpc_offset_weights):

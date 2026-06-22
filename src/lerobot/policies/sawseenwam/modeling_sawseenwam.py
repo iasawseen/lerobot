@@ -188,14 +188,22 @@ class WAMFlowMatching(VLAFlowMatching):
     ) -> Tensor:
         """Roll candidates through the new dual-encoder JEPA's predictor.
 
-        Two dispatch paths (``self.config.mpc_horizon_mode``):
+        Three dispatch paths (``self.config.mpc_horizon_mode``):
 
-          * ``"single"`` — AR rollout at k=1 for ``chunk_size`` steps,
-            matching SawSeenVLAWM behavior under the new action_encoder API.
+          * ``"single"`` (default) — single-shot var-stride prediction at
+            ``k_tail = latent_goal_offset``. One ``predict()`` call per
+            candidate; the predicted state at +k_tail is compared (MSE)
+            to z_g (also at +k_tail). Fastest path; requires k_tail in
+            the checkpoint's trained ``k_choices``.
 
-          * ``"multi_offset"`` — for each ``k`` in ``self.config.mpc_offsets``,
-            one var-stride single-shot prediction at k_tail=k, MSE-to-z_g
-            multiplied by the corresponding weight; summed across offsets.
+          * ``"ar"`` — autoregressive rollout at k=1 for ``k_tail``
+            steps. ``predict()`` called k_tail times. Slower but works
+            when the checkpoint wasn't trained at the desired k_tail.
+
+          * ``"multi_offset"`` — for each ``k`` in
+            ``self.config.mpc_offsets``, one var-stride single-shot
+            prediction at k_tail=k, MSE-to-z_g multiplied by the
+            corresponding weight; summed across offsets.
 
         Args:
             z_t_emb: ``(B, D)`` current latent in JEPA-projector space.
@@ -208,9 +216,20 @@ class WAMFlowMatching(VLAFlowMatching):
             ``cost``: ``(B, N)`` per-candidate cost.
         """
         assert self.lewm_world is not None, "MPC enabled without lewm_world loaded"
-        if self.config.mpc_horizon_mode == "multi_offset":
-            return self._rollout_multi_offset(z_t_emb, z_g_emb, candidates)
-        return self._rollout_single_ar(z_t_emb, z_g_emb, candidates)
+        mode = self.config.mpc_horizon_mode
+        if mode == "multi_offset":
+            return self._rollout_multi_offset_impl(
+                z_t_emb, z_g_emb, candidates,
+                list(self.config.mpc_offsets),
+                list(self.config.mpc_offset_weights),
+            )
+        if mode == "ar":
+            return self._rollout_ar(z_t_emb, z_g_emb, candidates)
+        # "single" — single-shot at k_tail = latent_goal_offset
+        k = self.config.latent_goal_offset
+        return self._rollout_multi_offset_impl(
+            z_t_emb, z_g_emb, candidates, [k], [1.0],
+        )
 
     def _action_buffer_zeros(self, B_eff: int, T_slots: int, A: int, device, dtype) -> Tensor:
         """Empty ``(B_eff, T_slots, k_max, A)`` action tensor."""
@@ -222,7 +241,7 @@ class WAMFlowMatching(VLAFlowMatching):
         k = torch.tensor(k_list, device=device, dtype=torch.long)
         return k.view(1, -1).expand(B_eff, -1).contiguous()
 
-    def _rollout_single_ar(
+    def _rollout_ar(
         self,
         z_t_emb: Tensor,
         z_g_emb: Tensor,
@@ -301,13 +320,15 @@ class WAMFlowMatching(VLAFlowMatching):
         cost = ((z_final - z_g_flat) ** 2).sum(dim=-1)  # (B*N,)
         return cost.view(B, N)
 
-    def _rollout_multi_offset(
+    def _rollout_multi_offset_impl(
         self,
         z_t_emb: Tensor,
         z_g_emb: Tensor,
         candidates: Tensor,
+        offsets: list[int],
+        weights: list[float],
     ) -> Tensor:
-        """For each k in mpc_offsets, single-shot var-stride prediction
+        """For each k in ``offsets``, single-shot var-stride prediction
         at k_tail=k from the fabricated 3-slot history. Cost is the
         weighted sum of per-offset MSE-to-z_g (same goal across offsets).
 
@@ -317,7 +338,9 @@ class WAMFlowMatching(VLAFlowMatching):
                     hold the candidate's first k actions.
 
         One ``predict_step`` per offset; cheap relative to AR rollouts of
-        length T.
+        length T. Called by the dispatcher for both ``"single"`` mode
+        (offsets=[latent_goal_offset], weights=[1.0]) and
+        ``"multi_offset"`` mode (caller-provided offsets/weights).
         """
         assert self.lewm_world is not None
         B, N, T, A = candidates.shape
@@ -325,8 +348,6 @@ class WAMFlowMatching(VLAFlowMatching):
         device = candidates.device
         dtype = candidates.dtype
         flat = candidates.reshape(B * N, T, A)
-        offsets = list(self.config.mpc_offsets)
-        weights = list(self.config.mpc_offset_weights)
 
         # History embedding: repeat z_t HS times (same fabrication as AR
         # path).

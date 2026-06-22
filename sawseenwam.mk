@@ -76,8 +76,10 @@ LEWM_IMAGE_W     ?= 224
 # Ordered tuple of pixel keys feeding into the dual encoders. The first
 # entry binds to encoders[0] (agentview), the second to encoders[1]
 # (eye-in-hand). Must match the order baked into the loaded JEPA's
-# .pixel_keys (the new-lewm CLAUDE.md calls this load-bearing).
-LEWM_PIXEL_KEYS  ?= '("pixels","pixels_wrist")'
+# .pixel_keys (the new-lewm CLAUDE.md calls this load-bearing). draccus
+# doesn't parse Python tuple literals from CLI cleanly — leave the
+# default ``("pixels","pixels_wrist")`` from the config and edit the
+# config if you need a different order.
 LEWM_MULTI_TOKEN ?= false
 
 LEWM_INJECT_TO   ?= suffix
@@ -132,11 +134,13 @@ MPC_HORIZON_MODE   ?= single
 # Comma-separated k_tail offsets. Each must be in the checkpoint's
 # trained k_choices. Max value must be ≤ chunk_size (the longest
 # offset slot needs that many candidate actions).
-# The latest new-lewm checkpoint trains with k_choices=(1,2,5,10,25),
-# so MPC_OFFSETS values must be ⊆ that set. (25,) is the largest
-# single-offset; mixed e.g. (10,25) gives multi-horizon scoring.
-MPC_OFFSETS        ?= '(25,)'
-MPC_OFFSET_WEIGHTS ?= '(1.0,)'
+# MPC_OFFSETS / MPC_OFFSET_WEIGHTS are tuple-valued; draccus doesn't
+# cleanly parse Python tuple literals from CLI strings (it iterates
+# the string as characters, not parses as a tuple). Edit the config
+# defaults directly to override — they live in
+# configuration_sawseenwam.py:mpc_offsets / mpc_offset_weights.
+# Defaults: mpc_offsets=(25,), mpc_offset_weights=(1.0,) — matches the
+# latest checkpoint's k_choices.
 # Encoder's k_max — baked into the JEPA at training. Latest new-lewm
 # uses k_max=25 (k_choices=(1,2,5,10,25)); set to 16 if loading an
 # earlier checkpoint with k_choices=(1,2,4,8,16).
@@ -190,7 +194,6 @@ train:
 	  --policy.lewm_num_tokens=$(LEWM_NUM_TOKENS) \
 	  --policy.lewm_image_height=$(LEWM_IMAGE_H) \
 	  --policy.lewm_image_width=$(LEWM_IMAGE_W) \
-	  --policy.lewm_pixel_keys=$(LEWM_PIXEL_KEYS) \
 	  --policy.lewm_multi_token=$(LEWM_MULTI_TOKEN) \
 	  --policy.lewm_inject_to=$(LEWM_INJECT_TO) \
 	  --policy.latent_goal_enabled=$(LATENT_GOAL) \
@@ -251,8 +254,6 @@ eval-mpc:
 	  --policy.mpc_score_floor_margin=$(MPC_SCORE_FLOOR_MARGIN) \
 	  --policy.mpc_icem_beta=$(MPC_ICEM_BETA) \
 	  --policy.mpc_horizon_mode=$(MPC_HORIZON_MODE) \
-	  --policy.mpc_offsets=$(MPC_OFFSETS) \
-	  --policy.mpc_offset_weights=$(MPC_OFFSET_WEIGHTS) \
 	  --policy.mpc_action_k_max=$(MPC_ACTION_K_MAX) \
 	  --policy.mpc_predictor_path=/lewm/$(LEWM_CKPT_NAME) \
 	  --env.type=libero \
