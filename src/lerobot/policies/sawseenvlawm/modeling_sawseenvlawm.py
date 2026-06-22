@@ -1043,8 +1043,17 @@ class VLAFlowMatching(nn.Module):
 
         return embs, pad_masks, att_masks
 
-    def compute_lewm_tokens(self, images: list[torch.Tensor]) -> torch.Tensor | None:
+    def compute_lewm_tokens(
+        self,
+        images: list[torch.Tensor],
+        state: torch.Tensor | None = None,
+    ) -> torch.Tensor | None:
         """Concatenate cameras horizontally and run the le-wm encoder once.
+
+        ``state`` is accepted (with a None default for backward compat)
+        so subclasses with proprio-aware encoders can plumb proprio
+        through without changing the call sites. The parent ignores it —
+        the legacy single-encoder lewm doesn't take proprio.
 
         le-wm trained on libero with the two cameras (agentview +
         eye-in-hand) stacked horizontally as a single ``(H, 2W, 3)``
@@ -1219,9 +1228,17 @@ class VLAFlowMatching(nn.Module):
         att_mask = att_mask[None, :].expand(bsize, 2)
         return embs, pad_mask, att_mask
 
-    def _encode_lewm_emb(self, images: list[torch.Tensor]) -> torch.Tensor:
+    def _encode_lewm_emb(
+        self,
+        images: list[torch.Tensor],
+        state: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Encode camera-concatenated images via the frozen le-wm encoder
         and return the **post-projector** latent (B, 192).
+
+        ``state`` is accepted (with a None default for backward compat) so
+        subclasses can plumb proprio through to proprio-aware JEPAs.
+        The parent ignores it.
 
         Routes through ``lewm_encoder.encode_cls``: ViT CLS → LeWM's MLP
         projector → JEPA prediction space. Used for both the Latent Goal
@@ -1254,7 +1271,7 @@ class VLAFlowMatching(nn.Module):
         time_expanded = time[:, None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
-        suffix_lewm = self.compute_lewm_tokens(images)  # None unless lewm_inject_to="suffix"
+        suffix_lewm = self.compute_lewm_tokens(images, state=state)  # None unless lewm_inject_to="suffix"
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks, state=state
         )
@@ -1280,8 +1297,12 @@ class VLAFlowMatching(nn.Module):
                     "latent_goal_inject_to_action=True requires chunk_end_images in "
                     "forward(); observation_delta_indices=[0, chunk_size] should be set."
                 )
-            z_t_anchor = self._encode_lewm_emb(images)              # (B, 192)
-            z_g_target = self._encode_lewm_emb(chunk_end_images)    # (B, 192)
+            # NOTE: chunk_end_state isn't currently threaded through forward
+            # — for proprio-in-state JEPAs, encoding chunk_end_images without
+            # the chunk-end proprio raises a clean error from encode_states.
+            # The "baseline-no-LGE" run skips this branch entirely.
+            z_t_anchor = self._encode_lewm_emb(images, state=state)         # (B, 192)
+            z_g_target = self._encode_lewm_emb(chunk_end_images)            # (B, 192)
 
             # ── Pass 1: prefix-only forward → VLM K/V cache ──
             prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
@@ -1455,8 +1476,8 @@ class VLAFlowMatching(nn.Module):
             suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(
                 x_t, time, suffix_lewm
             )
-            z_t_anchor = self._encode_lewm_emb(images)              # (B, 192)
-            z_g_target = self._encode_lewm_emb(chunk_end_images)    # (B, 192)
+            z_t_anchor = self._encode_lewm_emb(images, state=state)     # (B, 192)
+            z_g_target = self._encode_lewm_emb(chunk_end_images)        # (B, 192)
 
             latent_goal_noise = self.sample_noise(z_g_target.shape, z_g_target.device)
             latent_goal_time = self.sample_time(z_g_target.shape[0], z_g_target.device)
@@ -1571,7 +1592,7 @@ class VLAFlowMatching(nn.Module):
         bsize = state.shape[0]
         device = state.device
 
-        suffix_lewm_tokens = self.compute_lewm_tokens(images)
+        suffix_lewm_tokens = self.compute_lewm_tokens(images, state=state)
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks, state=state
         )
@@ -1595,7 +1616,7 @@ class VLAFlowMatching(nn.Module):
         z_t_emb: torch.Tensor | None = None
         z_g_emb: torch.Tensor | None = None
         if mode3:
-            z_t_emb = self._encode_lewm_emb(images)
+            z_t_emb = self._encode_lewm_emb(images, state=state)
             z_g_emb = self._latent_goal_denoise(z_t_emb, prefix_pad_masks, past_key_values)
             zt_tok = self.latent_goal_action_zt_proj(
                 z_t_emb.to(self.latent_goal_action_zt_proj.weight.dtype)
@@ -1607,7 +1628,7 @@ class VLAFlowMatching(nn.Module):
         elif self.config.mpc_enabled:
             # MPC without Mode 3 still needs both anchors for predictor
             # rollout + scoring. Compute them here on the same cache.
-            z_t_emb = self._encode_lewm_emb(images)
+            z_t_emb = self._encode_lewm_emb(images, state=state)
             z_g_emb = self._latent_goal_denoise(z_t_emb, prefix_pad_masks, past_key_values)
 
         return {

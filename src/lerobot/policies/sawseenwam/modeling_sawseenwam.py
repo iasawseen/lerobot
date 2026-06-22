@@ -139,7 +139,30 @@ class WAMFlowMatching(VLAFlowMatching):
             )
         return {keys[i]: images[i] for i in range(len(keys))}
 
-    def compute_lewm_tokens(self, images: list[Tensor]) -> Tensor | None:
+    def _state_to_lewm_proprio(self, state: Tensor | None) -> Tensor | None:
+        """Slice the policy's padded state down to the JEPA's training
+        ``proprio_dim`` (8 by default for LIBERO).
+
+        The policy carries state padded to ``max_state_dim=32``; the JEPA's
+        ``proprio_enc`` was trained at the dataset's *true* proprio width
+        (typically 8 = 7 joint + 1 gripper). Returns None if ``state`` is
+        None — caller decides whether to forward None (legacy ckpt, OK)
+        or raise (proprio-in-state ckpt, missing input).
+        """
+        if state is None:
+            return None
+        p = self.config.lewm_proprio_dim
+        if state.shape[-1] < p:
+            raise ValueError(
+                f"state has dim {state.shape[-1]} < lewm_proprio_dim={p}; "
+                f"the policy's state pad width is too narrow for the JEPA "
+                f"proprio it was trained on."
+            )
+        return state[..., :p]
+
+    def compute_lewm_tokens(
+        self, images: list[Tensor], state: Tensor | None = None
+    ) -> Tensor | None:
         """Per-camera CLS tokens projected to the action expert's hidden size.
 
         Returns ``(B, n_cam, expert_hidden)`` (or ``(B, K, expert_hidden)``
@@ -147,16 +170,28 @@ class WAMFlowMatching(VLAFlowMatching):
         tokens with bidirectional attention (one block, ``att_mask=[1, 0,
         ..., 0]``) — same wiring as the parent's single-cam case, but the
         token count is now per-camera rather than per-patch-slice.
+
+        ``state`` is sliced to ``lewm_proprio_dim`` and forwarded to the
+        encoder for proprio-in-state checkpoints; ignored otherwise.
         """
         if self.lewm_encoder is None or self.lewm_proj is None:
             return None
         img_dict = self._images_to_lewm_dict(images)
-        tokens = self.lewm_encoder.encode_tokens(img_dict)  # (B, n_cam, 192) or (B, K, 192)
+        proprio = self._state_to_lewm_proprio(state)
+        tokens = self.lewm_encoder.encode_tokens(img_dict, proprio=proprio)
         return self.lewm_proj(tokens.to(self.lewm_proj.weight.dtype))
 
-    def _encode_lewm_emb(self, images: list[Tensor]) -> Tensor:
+    def _encode_lewm_emb(
+        self, images: list[Tensor], state: Tensor | None = None
+    ) -> Tensor:
         """Single post-projector latent per batch element (B, D) — used as
         LGE anchor (current frame) and LGE regression target (chunk-end).
+
+        ``state`` is sliced to ``lewm_proprio_dim`` and forwarded to the
+        encoder for proprio-in-state checkpoints; ignored otherwise. The
+        encoder raises a clear error if the loaded JEPA needs proprio
+        but ``state`` is None (e.g. chunk-end encoding without
+        chunk-end state — that wiring isn't supported yet).
         """
         if self.lewm_encoder is None:
             raise RuntimeError(
@@ -164,8 +199,9 @@ class WAMFlowMatching(VLAFlowMatching):
                 "Set lewm_encoder_path in the config."
             )
         img_dict = self._images_to_lewm_dict(images)
+        proprio = self._state_to_lewm_proprio(state)
         with torch.no_grad():
-            emb = self.lewm_encoder.encode_cls(img_dict)  # (B, D) or (B, K, D)
+            emb = self.lewm_encoder.encode_cls(img_dict, proprio=proprio)  # (B, D) or (B, K, D)
 
         # LGE supervises against a (B, D) target — if the JEPA is in
         # multi-token Plan B mode, flatten the K axis into D so LGE sees

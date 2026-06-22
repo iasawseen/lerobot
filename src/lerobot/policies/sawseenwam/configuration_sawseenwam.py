@@ -138,6 +138,16 @@ class SawSeenWAMConfig(PreTrainedConfig):
     lewm_multi_token: bool = False
     # Where lewm tokens enter the model — same semantics as SawSeenVLAWM.
     lewm_inject_to: str = "suffix"
+    # Proprio dimensionality the loaded JEPA was trained on. The new
+    # ``proprio-in-state`` checkpoints (e.g. baseline_proprio_mt_voex16)
+    # carry a ``proprio_enc`` module that consumes a ``proprio_dim``-wide
+    # state vector and fuses it into the encoder output before the
+    # projector. The policy's ``observation.state`` is padded to
+    # ``max_state_dim`` (=32); we slice ``state[:, :lewm_proprio_dim]``
+    # before passing to the encoder. For LIBERO the JEPA was trained at
+    # ``proprio_dim=8`` (7 joint + 1 gripper). Ignored when the loaded
+    # JEPA has no ``proprio_enc``.
+    lewm_proprio_dim: int = 8
 
     # ── Latent Goal Expert (LGE) — identical to SawSeenVLAWM ─────────
     latent_goal_enabled: bool = False

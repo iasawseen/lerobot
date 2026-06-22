@@ -233,12 +233,33 @@ class LeWMDualWorldModel(nn.Module):
 
     # ── encode / predict helpers ─────────────────────────────────────
 
-    def encode_states(self, images: dict[str, Tensor]) -> Tensor:
+    @property
+    def needs_proprio(self) -> bool:
+        """True iff the loaded JEPA's ``encode`` requires proprio.
+
+        The new ``proprio-in-state`` checkpoints carry a non-None
+        ``proprio_enc`` that fuses a per-frame proprio vector into the
+        encoder output before the projector. Pre-proprio checkpoints
+        (the original dual-encoder baseline) leave it None.
+        """
+        if self.jepa is None:
+            return False
+        return getattr(self.jepa, "proprio_enc", None) is not None
+
+    def encode_states(
+        self, images: dict[str, Tensor], proprio: Tensor | None = None
+    ) -> Tensor:
         """Encode a *batch of single-state* images via the new JEPA.
 
         Args:
             images: ``{pixel_key: (B, 3, H, W)}`` for each entry in
                 ``self.pixel_keys``. Other keys are tolerated and ignored.
+            proprio: optional ``(B, P)`` proprio tensor — required when
+                the loaded JEPA has a ``proprio_enc`` (proprio-in-state
+                checkpoints). Ignored otherwise. Caller is responsible
+                for slicing to the JEPA's training ``proprio_dim`` and
+                normalizing to the same space the JEPA trained on
+                (typically ``lerobot_meanstd`` for LIBERO).
 
         Returns:
             ``(B, D)`` single-token or ``(B, K, D)`` multi-token — the
@@ -251,6 +272,18 @@ class LeWMDualWorldModel(nn.Module):
                 raise KeyError(f"missing pixel key {key!r} (have: {list(images.keys())})")
             img = self._prep(images[key])  # (B, 3, 224, 224)
             info[key] = img.unsqueeze(1)  # add T axis: (B, 1, 3, 224, 224)
+
+        if self.needs_proprio:
+            if proprio is None:
+                raise ValueError(
+                    "loaded JEPA has proprio_enc (proprio-in-state checkpoint); "
+                    "encode_states requires proprio. Pass the policy's state "
+                    "sliced to the JEPA's training proprio_dim."
+                )
+            # JEPA._fuse_proprio expects (B, T, P) or (B, T, k, P); we add
+            # the T axis to match the (B, 1, ...) pixel layout.
+            param = next(self.jepa.proprio_enc.parameters())
+            info["proprio"] = proprio.to(param.dtype).unsqueeze(1)  # (B, 1, P)
 
         if self.freeze:
             with torch.no_grad():
@@ -334,15 +367,22 @@ class LeWMDualVisionEncoder(nn.Module):
     def freeze(self) -> bool:
         return self.world.freeze
 
-    def encode_cls(self, images: dict[str, Tensor]) -> Tensor:
+    def encode_cls(
+        self, images: dict[str, Tensor], proprio: Tensor | None = None
+    ) -> Tensor:
         """Single post-projector latent per batch element.
 
         Returns ``(B, D)`` single-token or ``(B, K, D)`` multi-token; the
         caller flattens / pools as needed for downstream consumers.
-        """
-        return self.world.encode_states(images)
 
-    def encode_tokens(self, images: dict[str, Tensor]) -> Tensor:
+        ``proprio`` is forwarded to the underlying ``encode_states`` —
+        required by proprio-in-state checkpoints, ignored otherwise.
+        """
+        return self.world.encode_states(images, proprio=proprio)
+
+    def encode_tokens(
+        self, images: dict[str, Tensor], proprio: Tensor | None = None
+    ) -> Tensor:
         """Per-camera post-projector latents stacked along a token axis.
 
         Returns ``(B, n_cam, D)`` (single-token, one CLS-derived token per
@@ -363,7 +403,18 @@ class LeWMDualVisionEncoder(nn.Module):
         """
         assert self.world.jepa is not None, "LeWMDualWorldModel not loaded"
         if self.world.multi_token:
-            return self.world.encode_states(images)
+            return self.world.encode_states(images, proprio=proprio)
+
+        # Single-token path doesn't route through encode_states; if the
+        # JEPA has proprio_enc, the per-cam projector forwards below
+        # would silently skip proprio fusion. Fail loud rather than feed
+        # a half-baked embedding to the action expert.
+        if self.world.needs_proprio:
+            raise NotImplementedError(
+                "single-token (per-cam-split) encoding with proprio-in-state "
+                "is not wired. Use a multi-token checkpoint or extend "
+                "encode_tokens to fuse proprio in the per-cam projector path."
+            )
 
         # Single-token, per-camera split.
         jepa = self.world.jepa
