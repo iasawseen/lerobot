@@ -184,14 +184,22 @@ class WAMFlowMatching(VLAFlowMatching):
     def _encode_lewm_emb(
         self, images: list[Tensor], state: Tensor | None = None
     ) -> Tensor:
-        """Single post-projector latent per batch element (B, D) — used as
-        LGE anchor (current frame) and LGE regression target (chunk-end).
+        """Post-projector latent per batch element — used as LGE anchor
+        and LGE regression target.
+
+        Returns:
+            * ``(B, D)`` for legacy single-token JEPA (always).
+            * ``(B, K, D)`` for multi-token JEPA when
+              ``latent_goal_residual=True`` — the residual LGE path
+              keeps the K axis end-to-end (per le-wm's Plan-B SIGReg
+              convention).
+            * ``(B, K*D)`` for multi-token JEPA when
+              ``latent_goal_residual=False`` — legacy compatibility:
+              flatten K*D so downstream code that expects 2D
+              ``z_t / z_g`` still works.
 
         ``state`` is sliced to ``lewm_proprio_dim`` and forwarded to the
-        encoder for proprio-in-state checkpoints; ignored otherwise. The
-        encoder raises a clear error if the loaded JEPA needs proprio
-        but ``state`` is None (e.g. chunk-end encoding without
-        chunk-end state — that wiring isn't supported yet).
+        encoder for proprio-in-state checkpoints; ignored otherwise.
         """
         if self.lewm_encoder is None:
             raise RuntimeError(
@@ -203,13 +211,13 @@ class WAMFlowMatching(VLAFlowMatching):
         with torch.no_grad():
             emb = self.lewm_encoder.encode_cls(img_dict, proprio=proprio)  # (B, D) or (B, K, D)
 
-        # LGE supervises against a (B, D) target — if the JEPA is in
-        # multi-token Plan B mode, flatten the K axis into D so LGE sees
-        # a single vector. Keep this path explicit so configs that
-        # accidentally pair lewm_multi_token=True with a checkpoint that
-        # doesn't have query_reducers raise at load (in
-        # LeWMDualWorldModel.from_lewm_checkpoint), not silently here.
-        if emb.ndim == 3:
+        # Residual LGE path keeps the K axis native — the LGE expert
+        # processes a length-K sequence, in/out projectors broadcast
+        # over K via nn.Linear's last-dim contract, SIGReg follows
+        # le-wm's Plan-B "(b k d) -> 1 (b k) d" pattern. Legacy
+        # non-residual path collapses K into D for compat with the
+        # original (B, D) LGE projectors.
+        if emb.ndim == 3 and not self.config.latent_goal_residual:
             B, K, D = emb.shape
             emb = emb.reshape(B, K * D)
         return emb
@@ -311,20 +319,17 @@ class WAMFlowMatching(VLAFlowMatching):
         flat = candidates[:, :, :T_rollout, :].reshape(B * N, T_rollout, A)
 
         # Initial history embedding: repeat z_t HS times.
-        z_t_flat = z_t_emb.repeat_interleave(N, dim=0)  # (B*N, D) or (B*N, K*D)
+        z_t_flat = z_t_emb.repeat_interleave(N, dim=0)  # (B*N, D) or (B*N, K, D)
         if z_t_flat.ndim == 2:
             # Single-token JEPA: (B*N, D) → (B*N, HS, D).
             emb_buf = z_t_flat.unsqueeze(1).expand(-1, HS, -1).contiguous()
+        elif z_t_flat.ndim == 3:
+            # Multi-token JEPA (Plan B): (B*N, K, D) → (B*N, HS, K, D).
+            # The predictor keeps the K axis (jepa.py:517); residual-LGE
+            # checkpoints carry z_t through as (B, K, D) end-to-end.
+            emb_buf = z_t_flat.unsqueeze(1).expand(-1, HS, -1, -1).contiguous()
         else:
-            # Multi-token JEPA path (Plan B): the LGE was supervised on
-            # the flattened latent, but the predictor still works in the
-            # (B, T, K, D) shape. Reshape back.
-            B_eff, KD = z_t_flat.shape
-            K = self.lewm_world.jepa.encoders[0].config.hidden_size  # placeholder
-            raise NotImplementedError(
-                "multi-token (Plan B) MPC rollout not yet wired — emb_buf "
-                "needs to be (B*N, HS, K, D) but z_t arrives flattened."
-            )
+            raise RuntimeError(f"unexpected z_t ndim {z_t_flat.ndim}; want 2 or 3")
 
         # Past-action slots (HS-1 fabricated zero actions).
         past_act = torch.zeros(B * N, HS - 1, A, device=device, dtype=dtype)
@@ -351,9 +356,9 @@ class WAMFlowMatching(VLAFlowMatching):
             next_emb = pred[:, -1:, :].to(emb_buf.dtype)
             emb_buf = torch.cat([emb_buf, next_emb], dim=1)
 
-        z_final = emb_buf[:, -1].to(torch.float32)  # (B*N, D)
+        z_final = emb_buf[:, -1].to(torch.float32)  # (B*N, D) or (B*N, K, D)
         z_g_flat = z_g_emb.repeat_interleave(N, dim=0).to(torch.float32)
-        cost = ((z_final - z_g_flat) ** 2).sum(dim=-1)  # (B*N,)
+        cost = ((z_final - z_g_flat) ** 2).flatten(1).sum(dim=-1)  # (B*N,)
         return cost.view(B, N)
 
     def _rollout_multi_offset_impl(
@@ -386,13 +391,17 @@ class WAMFlowMatching(VLAFlowMatching):
         flat = candidates.reshape(B * N, T, A)
 
         # History embedding: repeat z_t HS times (same fabrication as AR
-        # path).
+        # path). Single-token z_t is (B*N, D) → (B*N, HS, D); multi-token
+        # (Plan B) z_t is (B*N, K, D) → (B*N, HS, K, D). The predictor
+        # infers token-ness from emb.ndim (jepa.py:517), and
+        # encode_actions/predict_step are shape-agnostic to K.
         z_t_flat = z_t_emb.repeat_interleave(N, dim=0)
-        if z_t_flat.ndim != 2:
-            raise NotImplementedError(
-                "multi-token (Plan B) MPC rollout not yet wired for multi_offset."
-            )
-        emb_buf = z_t_flat.unsqueeze(1).expand(-1, HS, -1).contiguous()  # (B*N, 3, D)
+        if z_t_flat.ndim == 2:
+            emb_buf = z_t_flat.unsqueeze(1).expand(-1, HS, -1).contiguous()  # (B*N, HS, D)
+        elif z_t_flat.ndim == 3:
+            emb_buf = z_t_flat.unsqueeze(1).expand(-1, HS, -1, -1).contiguous()  # (B*N, HS, K, D)
+        else:
+            raise RuntimeError(f"unexpected z_t ndim {z_t_flat.ndim}; want 2 (single) or 3 (multi-token)")
         z_g_flat = z_g_emb.repeat_interleave(N, dim=0).to(torch.float32)
 
         total_cost = torch.zeros(B * N, device=device, dtype=torch.float32)
@@ -412,8 +421,11 @@ class WAMFlowMatching(VLAFlowMatching):
 
             act_emb, action_tokens = self.lewm_world.encode_actions(act_packed, k_per_slot)
             pred = self.lewm_world.predict_step(emb_buf, act_emb, action_tokens=action_tokens)
-            z_pred = pred[:, -1].to(torch.float32)  # (B*N, D) — state at +k_tail
-            sqerr = ((z_pred - z_g_flat) ** 2).sum(dim=-1)
+            # pred[:, -1] is the +k_tail state: (B*N, D) single-token or
+            # (B*N, K, D) multi-token. flatten(1) collapses the trailing
+            # (K, D) → (K*D) so the squared error sums over all tokens.
+            z_pred = pred[:, -1].to(torch.float32)
+            sqerr = ((z_pred - z_g_flat) ** 2).flatten(1).sum(dim=-1)  # (B*N,)
             total_cost = total_cost + float(w) * sqerr
 
         return total_cost.view(B, N)

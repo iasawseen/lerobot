@@ -172,6 +172,41 @@ class SawSeenVLAWMConfig(PreTrainedConfig):
     # inference adds K Latent Goal Expert denoising steps before the action denoising
     # loop.
     latent_goal_inject_to_action: bool = False
+    # Residual LGE: parameterize the LGE as predicting Δz_g = z_g - z_t
+    # (a residual from the current frame to the chunk-end frame) instead
+    # of the absolute z_g. The reconstruction is ẑ_g = z_t + Δẑ_g, used
+    # for SIGReg and Mode-3 injection. Implications:
+    #   * Identity at init: if the LGE output projector is zero-init,
+    #     the model starts with ẑ_g = z_t (do-nothing baseline correct).
+    #   * Smaller effective target norm: at small k_tail the world barely
+    #     changes, so Δz_g is much smaller-norm than z_g. Easier target,
+    #     stronger relative gradient.
+    #   * Mode-3 injection: when this is on, the action expert sees a
+    #     single bank of K Δẑ_g tokens projected via
+    #     ``latent_goal_action_dz_proj`` (replacing the legacy
+    #     ``[zt_emb, zg_emb]`` 2-token pair). The current observation is
+    #     already in the suffix via the WM side-channel tokens, so
+    #     re-injecting z_t through the LGE bank is redundant.
+    #   * Multi-token-aware: when the JEPA emits ``(B, K, D)`` per state
+    #     (Plan-B), the residual path keeps the K axis end-to-end (no
+    #     ``reshape(B, K*D)`` collapse), and SIGReg follows le-wm's
+    #     own pattern (``rearrange "b k d -> 1 (b k) d"``).
+    latent_goal_residual: bool = False
+    # Multi-k LGE training: when set to a comma-separated string of
+    # integer offsets (e.g. ``"5,10,15,20,25"``), the LGE is trained
+    # to predict residuals at multiple future horizons rather than the
+    # single ``latent_goal_target_offset``. Training samples one k per
+    # batch sample uniformly from the parsed offsets and conditions
+    # the LGE on it via a new ``latent_goal_k_emb`` suffix token.
+    # Dataset must return observations at all the offsets
+    # (``observation_delta_indices`` = ``[0] + parsed_offsets``).
+    # At inference, the LGE is queried at the single offset given by
+    # ``latent_goal_target_offset`` — only the training signal is
+    # multi-k. Empty string (default) = legacy single-k path.
+    #
+    # Note: a CSV string field, not a ``tuple[int, ...]``, because
+    # draccus can't cleanly parse tuple literals from CLI strings.
+    latent_goal_target_offsets: str = ""
     # Source of z_g going into the action expert during training:
     #   "encoded"  — frozen le-wm CLS of the dataset's chunk-end frame.
     #                Train-only; falls back to "predicted" at inference.
@@ -506,6 +541,30 @@ class SawSeenVLAWMConfig(PreTrainedConfig):
             num_warmup_steps=self.scheduler_warmup_steps,
             num_decay_steps=self.scheduler_decay_steps,
         )
+
+    @property
+    def parsed_latent_goal_target_offsets(self) -> list[int]:
+        """Parse the CSV ``latent_goal_target_offsets`` field.
+
+        Returns a sorted, deduped list of positive integers (e.g.
+        ``[5, 10, 15, 20, 25]``). Empty string yields an empty list
+        (= single-k legacy path is engaged elsewhere).
+        """
+        s = (self.latent_goal_target_offsets or "").strip()
+        if not s:
+            return []
+        try:
+            vals = [int(x) for x in s.split(",") if x.strip()]
+        except ValueError as e:
+            raise ValueError(
+                f"latent_goal_target_offsets must be comma-separated ints, "
+                f"got {self.latent_goal_target_offsets!r}"
+            ) from e
+        if any(v <= 0 for v in vals):
+            raise ValueError(
+                f"latent_goal_target_offsets must be positive, got {vals}"
+            )
+        return sorted(set(vals))
 
     @property
     def observation_delta_indices(self) -> list:

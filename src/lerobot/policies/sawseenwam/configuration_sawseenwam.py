@@ -181,6 +181,16 @@ class SawSeenWAMConfig(PreTrainedConfig):
 
     # ── Mode 3 LGE-conditioned action expert ─────────────────────────
     latent_goal_inject_to_action: bool = False
+    # See parent (sawseenvlawm/configuration_sawseenvlawm.py) for the
+    # design rationale. When True, the LGE predicts Δz_g instead of z_g,
+    # the Mode-3 injection becomes a single K-token bank
+    # (Δẑ_g via ``latent_goal_action_dz_proj``), and multi-token JEPA
+    # outputs ``(B, K, D)`` are kept native end-to-end.
+    latent_goal_residual: bool = False
+    # See parent for multi-k LGE rationale. CSV string (e.g. "5,10,15,20,25"),
+    # empty = single-k legacy. (CSV instead of tuple because draccus
+    # can't parse tuple literals from CLI.)
+    latent_goal_target_offsets: str = ""
     latent_goal_inject_z_g_source: str = "encoded"
     latent_goal_inject_schedule_end_step: int = 0
     latent_goal_inject_schedule_start_step: int = 0
@@ -426,10 +436,40 @@ class SawSeenWAMConfig(PreTrainedConfig):
         return self.chunk_size
 
     @property
+    def parsed_latent_goal_target_offsets(self) -> list[int]:
+        """Parse the CSV ``latent_goal_target_offsets`` field.
+
+        Returns a sorted, deduped list of positive integers (e.g.
+        ``[5, 10, 15, 20, 25]``). Empty string yields an empty list
+        (= single-k legacy path is engaged elsewhere). Mirrors the
+        parent SawSeenVLAWMConfig property; both configs are siblings
+        under PreTrainedConfig so the helper has to live in each.
+        """
+        s = (self.latent_goal_target_offsets or "").strip()
+        if not s:
+            return []
+        try:
+            vals = [int(x) for x in s.split(",") if x.strip()]
+        except ValueError as e:
+            raise ValueError(
+                f"latent_goal_target_offsets must be comma-separated ints, "
+                f"got {self.latent_goal_target_offsets!r}"
+            ) from e
+        if any(v <= 0 for v in vals):
+            raise ValueError(
+                f"latent_goal_target_offsets must be positive, got {vals}"
+            )
+        return sorted(set(vals))
+
+    @property
     def observation_delta_indices(self) -> list:
-        if self.latent_goal_enabled:
-            return [0, self.latent_goal_offset]
-        return [0]
+        if not self.latent_goal_enabled:
+            return [0]
+        offsets = self.parsed_latent_goal_target_offsets
+        if offsets:
+            # Multi-k: dataset returns obs at [0, k1, k2, ...].
+            return [0] + offsets
+        return [0, self.latent_goal_offset]
 
     @property
     def action_delta_indices(self) -> list:

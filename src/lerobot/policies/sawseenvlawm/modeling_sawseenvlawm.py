@@ -422,13 +422,69 @@ class SawSeenVLAWMPolicy(PreTrainedPolicy):
 
         chunk_end_images = None
         chunk_end_pad_mask = None
+        chunk_end_state = None
+        multi_k_payload = None
         if self.config.latent_goal_enabled:
-            chunk_end_images, chunk_end_pad_mask = self.prepare_chunk_end_images(batch)
+            if self.config.parsed_latent_goal_target_offsets:
+                # Multi-k Option B: predict residuals at ALL horizons in
+                # one LGE forward (90 denoising tokens for 5 horizons × 18
+                # per state). No per-sample k sampling — every sample's
+                # LGE expert sees all 5 horizon banks. The action expert
+                # gets all 5 reconstructed ẑ_g banks concatenated as 90
+                # injection tokens. k-clamp at the loss level: per-(sample,
+                # horizon) pad mask drops the loss term where the horizon
+                # ran off the episode end.
+                offsets, per_k_imgs, per_k_states, per_k_pad = self.prepare_multi_k_chunk_ends(batch)
+                bsize = state.shape[0]
+                num_k = len(offsets)
+                if num_k == 0 or len(per_k_imgs) == 0:
+                    raise RuntimeError("multi-k offsets is empty")
+
+                # Stack all horizons along the batch axis for a single
+                # JEPA encoder forward downstream. For each cam:
+                #   stacked[c]: shape (num_k * B, C, H, W)
+                # The model's forward will reshape to (num_k, B, K, D) →
+                # (B, num_k, K, D) → (B, num_k*K, D).
+                num_cams = len(per_k_imgs[0])
+                chunk_end_images = []
+                for c in range(num_cams):
+                    chunk_end_images.append(
+                        torch.cat([per_k_imgs[i][c] for i in range(num_k)], dim=0)
+                    )
+
+                if any(s is None for s in per_k_states):
+                    chunk_end_state = None
+                else:
+                    # (num_k * B, max_state_dim)
+                    chunk_end_state = torch.cat(per_k_states, dim=0)
+
+                # Per-(sample, horizon) pad mask: True = invalid (chunk-end
+                # ran off episode end). Shape (B, num_k).
+                pad_stack = torch.stack(per_k_pad, dim=0)  # (num_k, B)
+                per_horizon_pad = pad_stack.t().contiguous()  # (B, num_k)
+
+                # chunk_end_pad_mask retains its (B,) shape for the
+                # sample-level "all horizons invalid" drop. With Option B
+                # we instead want per-horizon masking; the (B,) mask is
+                # True only when EVERY horizon is invalid (then the LGE
+                # loss for this sample is entirely zero).
+                chunk_end_pad_mask = per_horizon_pad.all(dim=1)  # (B,)
+
+                multi_k_payload = {
+                    "num_horizons": num_k,
+                    "per_horizon_pad": per_horizon_pad,  # (B, num_k)
+                    "offsets": offsets,
+                }
+            else:
+                chunk_end_images, chunk_end_pad_mask = self.prepare_chunk_end_images(batch)
+                chunk_end_state = self.prepare_chunk_end_state(batch)
 
         losses, latent_goal_loss, latent_goal_sigreg_loss = self.model.forward(
             images, img_masks, lang_tokens, lang_masks, state, actions, noise, time,
             chunk_end_images=chunk_end_images,
             chunk_end_pad_mask=chunk_end_pad_mask,
+            chunk_end_state=chunk_end_state,
+            multi_k_payload=multi_k_payload,
         )
         original_action_dim = self.config.action_feature.shape[0]
         losses = losses[:, :, :original_action_dim]
@@ -607,10 +663,105 @@ class SawSeenVLAWMPolicy(PreTrainedPolicy):
     def prepare_state(self, batch):
         """Pad state. Index 0 is the anchor frame; Latent Goal Expert-mode chunk-end state
         at index 1 is intentionally discarded — it's the *outcome* of the
-        actions and isn't an input."""
+        actions and isn't an input. The chunk-end state IS used as input
+        to proprio-in-state JEPAs for encoding the LGE regression target;
+        see ``prepare_chunk_end_state`` for that path."""
         state = batch[OBS_STATE][:, 0, :] if batch[OBS_STATE].ndim > 2 else batch[OBS_STATE]
         state = pad_vector(state, self.config.max_state_dim)
         return state
+
+    def prepare_chunk_end_state(self, batch):
+        """Pad state at the chunk-end frame (index 1 of OBS_STATE).
+
+        Used by proprio-in-state JEPAs (e.g. baseline_proprio_mt_voex16)
+        for encoding the LGE regression target z_g: ``encode_states``
+        requires proprio for *every* frame it encodes. Returns None when
+        OBS_STATE doesn't carry a chunk-end slice (LGE disabled, or
+        observation_delta_indices == [0]) so callers can skip without a
+        shape check.
+
+        Single-k mode: index 1 is the chunk-end. Multi-k mode: also
+        index 1 by default (the first non-zero index in
+        observation_delta_indices); for multi-k callers should use
+        ``prepare_multi_k_chunk_ends`` instead which slices per-k.
+        """
+        if batch[OBS_STATE].ndim <= 2 or batch[OBS_STATE].shape[1] < 2:
+            return None
+        state = batch[OBS_STATE][:, 1, :]
+        return pad_vector(state, self.config.max_state_dim)
+
+    def prepare_multi_k_chunk_ends(self, batch):
+        """For multi-k LGE training: return per-k chunk-end image/state lists.
+
+        Slices ``batch[OBS_*]`` at the indices corresponding to each
+        offset in ``latent_goal_target_offsets``. Returns:
+            ``offsets``       — sorted unique list of k values (matches
+                                ``observation_delta_indices[1:]``).
+            ``per_k_images``  — list of length len(offsets); each entry
+                                is a list of image tensors mirroring the
+                                ``prepare_chunk_end_images`` shape.
+            ``per_k_states``  — list of length len(offsets); each entry
+                                is a ``(B, max_state_dim)`` padded state
+                                or None if state isn't present.
+            ``per_k_pad``     — list of length len(offsets); each entry
+                                is a ``(B,)`` boolean drop mask
+                                (chunk-end fell off episode end).
+
+        Returns ``(None, None, None, None)`` when not in multi-k mode.
+        """
+        offsets = self.config.parsed_latent_goal_target_offsets
+        if not offsets:
+            return None, None, None, None
+        # observation_delta_indices is [0] + offsets; obs frames stack
+        # at indices [0, 1, 2, ...]. The i-th offset corresponds to obs
+        # index i+1.
+        per_k_images = []
+        per_k_states = []
+        per_k_pad = []
+        present_img_keys = [k for k in self.config.image_features if k in batch]
+
+        for i, _k in enumerate(offsets):
+            obs_idx = i + 1  # skip the anchor frame at index 0
+            images = []
+            per_cam_pads = []
+            for key in present_img_keys:
+                if batch[key].ndim != 5:
+                    raise ValueError(
+                        f"multi-k requires obs frames stacked: expected "
+                        f"{key} to be (B, T, C, H, W), got {batch[key].shape}"
+                    )
+                img = batch[key][:, obs_idx, :, :, :]
+                if self.config.resize_imgs_with_padding is not None:
+                    img = resize_with_pad(
+                        img, *self.config.resize_imgs_with_padding, pad_value=0
+                    )
+                img = img * 2.0 - 1.0  # to siglip range [-1, 1]
+                images.append(img)
+                # Per-camera pad mask at this offset.
+                pad_key = f"{key}_padding_mask"
+                if pad_key in batch and batch[pad_key].ndim >= 2:
+                    per_cam_pads.append(~batch[pad_key][:, obs_idx])
+            per_k_images.append(images)
+
+            # Per-sample drop mask: True if any cam was padded at this offset.
+            if per_cam_pads:
+                drop = per_cam_pads[0]
+                for m in per_cam_pads[1:]:
+                    drop = drop | m
+            else:
+                drop = torch.zeros(
+                    batch[OBS_STATE].shape[0], dtype=torch.bool, device=batch[OBS_STATE].device
+                )
+            per_k_pad.append(drop)
+
+            # Per-k state.
+            if batch[OBS_STATE].ndim > 2 and batch[OBS_STATE].shape[1] > obs_idx:
+                s = batch[OBS_STATE][:, obs_idx, :]
+                per_k_states.append(pad_vector(s, self.config.max_state_dim))
+            else:
+                per_k_states.append(None)
+
+        return offsets, per_k_images, per_k_states, per_k_pad
 
     def prepare_action(self, batch):
         """Pad action"""
@@ -656,11 +807,16 @@ class SawSeenVLAWMPolicy(PreTrainedPolicy):
                 "latent_goal_time_mlp_out",
                 "latent_goal_anchor_proj",
             ]
+            if cfg.parsed_latent_goal_target_offsets:
+                modules_to_save += ["latent_goal_k_emb"]
         if cfg.latent_goal_inject_to_action:
-            modules_to_save += [
-                "latent_goal_action_zt_proj",
-                "latent_goal_action_zg_proj",
-            ]
+            if cfg.latent_goal_residual:
+                modules_to_save += ["latent_goal_action_dz_proj"]
+            else:
+                modules_to_save += [
+                    "latent_goal_action_zt_proj",
+                    "latent_goal_action_zg_proj",
+                ]
         return {
             "target_modules": target_modules,
             "modules_to_save": modules_to_save,
@@ -793,23 +949,55 @@ class VLAFlowMatching(nn.Module):
         # parameters is the test for "do we inject."
         self.latent_goal_action_zt_proj: nn.Linear | None = None
         self.latent_goal_action_zg_proj: nn.Linear | None = None
+        self.latent_goal_action_dz_proj: nn.Linear | None = None
+        self.latent_goal_k_emb: nn.Embedding | None = None
         if self.config.latent_goal_enabled:
             latent_goal_hidden = self.vlm_with_expert.latent_goal_expert_hidden_size
-            # le-wm encoder output dim is 192 (ViT-Tiny). Hard-coded here
-            # because the encoder isn't loaded yet at projection-init time
-            # when ``lewm_encoder_path`` is None — but Latent Goal Expert always
+            # le-wm encoder output dim is 192 (ViT-Tiny / DinoV2-S). Hard-coded
+            # here because the encoder isn't loaded yet at projection-init
+            # time when ``lewm_encoder_path`` is None — but the LGE always
             # targets le-wm space regardless of whether action-expert
-            # injection is on.
+            # injection is on. Projectors operate on the trailing D=192
+            # axis; for multi-token JEPAs (``(B, K, D)``) the K axis is
+            # broadcast over by ``nn.Linear``'s last-dim contract.
             latent_goal_latent_dim = 192
             self.latent_goal_in_proj = nn.Linear(latent_goal_latent_dim, latent_goal_hidden)
             self.latent_goal_out_proj = nn.Linear(latent_goal_hidden, latent_goal_latent_dim)
+            # NOTE: out_proj uses the default Kaiming-uniform init. An
+            # earlier version of the residual path zero-initialized
+            # out_proj to make Δẑ_g=0 at init (identity ẑ_g = z_t), but
+            # that cuts ∂L/∂lge_expert ∝ W_out.T = 0 — gradient never
+            # reaches the LGE expert, freezing it at random init.
+            # Empirically LGE loss stayed at the predict-zero floor
+            # (~1.3) under zero-init.
             self.latent_goal_time_mlp_in = nn.Linear(latent_goal_hidden * 2, latent_goal_hidden)
             self.latent_goal_time_mlp_out = nn.Linear(latent_goal_hidden, latent_goal_hidden)
             self.latent_goal_anchor_proj = nn.Linear(latent_goal_latent_dim, latent_goal_hidden)
+            mk_offsets = self.config.parsed_latent_goal_target_offsets
+            if mk_offsets:
+                # Multi-k LGE: one learned embedding per supported k. The
+                # k_emb token is inserted between anchor and denoising
+                # tokens in ``embed_latent_goal_suffix`` so the LGE
+                # expert knows which horizon it's predicting.
+                self.latent_goal_k_emb = nn.Embedding(len(mk_offsets), latent_goal_hidden)
             if self.config.latent_goal_inject_to_action:
                 action_hidden = self.vlm_with_expert.expert_hidden_size
-                self.latent_goal_action_zt_proj = nn.Linear(latent_goal_latent_dim, action_hidden)
-                self.latent_goal_action_zg_proj = nn.Linear(latent_goal_latent_dim, action_hidden)
+                if self.config.latent_goal_residual:
+                    # One bank of K Δẑ_g tokens for the action expert
+                    # (replaces the legacy [z_t, z_g] pair). z_t info
+                    # already lives in the suffix via the WM side-channel
+                    # tokens, so we don't re-inject it through the LGE
+                    # bank — the LGE bank carries only "where to move."
+                    self.latent_goal_action_dz_proj = nn.Linear(
+                        latent_goal_latent_dim, action_hidden
+                    )
+                else:
+                    self.latent_goal_action_zt_proj = nn.Linear(
+                        latent_goal_latent_dim, action_hidden
+                    )
+                    self.latent_goal_action_zg_proj = nn.Linear(
+                        latent_goal_latent_dim, action_hidden
+                    )
 
         # Optional SIGReg regularizer on the LGE's reconstructed clean
         # prediction (only built when both LGE is on and the weight > 0).
@@ -1168,40 +1356,82 @@ class VLAFlowMatching(nn.Module):
         anchor_z: torch.Tensor,
         noisy_z: torch.Tensor,
         timestep: torch.Tensor,
+        k_idx: torch.Tensor | None = None,
     ):
-        """Build the Latent Goal Expert's 2-token suffix.
+        """Build the LGE's anchor + denoising suffix (K anchor + K noisy = 2K tokens,
+        plus an optional k_emb token in multi-k mode: 2K+1).
 
         Tokens (in this order):
-          0. ``anchor_z_t`` — frozen le-wm encoding of the *current* frame,
-             projected into Latent Goal Expert space. Acts as the same-space anchor
-             the Latent Goal Expert conditions on (matches Phase B's WM rollout
-             starting point).
-          1. ``noisy_z_g + time`` — the denoising token; flow-matching
-             velocity is read from this position at the Latent Goal Expert's output.
+          [0..K-1]      ``anchor_z_t`` — frozen le-wm encoding of the
+                        *current* frame, projected into LGE space.
+                        Single-token K=1 (legacy) or multi-token K=18
+                        (Plan B).
+          [K]           (multi-k only) ``k_emb`` — learned embedding
+                        of the target horizon index k. Tells the LGE
+                        expert which future offset it's predicting.
+          [K+m..2K+m-1] ``noisy_z_g (or Δz_g if residual) + time`` —
+                        the denoising tokens; flow-matching velocity
+                        is read from these positions at the LGE's
+                        output. m = 1 if multi-k else 0.
 
-        Both tokens share one attention block (att_mask=[1, 0]) so they're
-        bidirectional within the Latent Goal Expert suffix. The block sits after the action
-        tokens in the global cumulative-mask scheme, so action tokens cannot
-        see Latent Goal Expert. The reverse direction (Latent Goal Expert → action / Latent Goal Expert → suffix-lewm) is
-        blocked by an additional 2D-mask edit in ``forward()`` so that Latent Goal Expert
-        predicts the chunk-end state purely from (prefix, z_t anchor),
-        independent of the action chunk being committed.
+        All tokens share one bidirectional attention block
+        (``att_mask=[1, 0, ..., 0]``). The block sits after the action
+        tokens in the global cumulative-mask scheme so action tokens
+        cannot see LGE.
+
+        Accepts ``(B, D)`` (legacy single-token) or ``(B, K, D)``
+        (multi-token Plan B) for both ``anchor_z`` and ``noisy_z``.
+        ``k_idx`` is shape ``(B,)`` long — required when the model was
+        built with ``latent_goal_k_emb``, ignored otherwise.
         """
         if anchor_z.dim() == 2:
-            anchor_z = anchor_z.unsqueeze(1)
+            anchor_z = anchor_z.unsqueeze(1)  # (B, 1, D)
         if noisy_z.dim() == 2:
-            noisy_z = noisy_z.unsqueeze(1)
+            noisy_z = noisy_z.unsqueeze(1)  # (B, 1, D)
+        K_anchor = anchor_z.shape[1]   # tokens per state (e.g. 18 for Plan B)
+        K_noise = noisy_z.shape[1]     # denoising tokens — K_anchor (single-k) or
+                                        # num_horizons * K_anchor (multi-k Option B)
+        # Multi-k Option B detection: more denoising slots than anchor slots.
+        # Each block of K_anchor contiguous denoising tokens corresponds to
+        # one horizon. We add a per-slot k_pos_emb to each denoising token
+        # so the LGE expert can distinguish which horizon a slot predicts.
+        multi_k_b = (
+            self.latent_goal_k_emb is not None
+            and K_noise > K_anchor
+            and K_noise % K_anchor == 0
+        )
 
-        # Anchor token: deterministic projection of z_t into Latent Goal Expert hidden.
+        # Anchor tokens: deterministic projection of z_t into LGE hidden.
         anchor_emb = self.latent_goal_anchor_proj(
             anchor_z.to(self.latent_goal_anchor_proj.weight.dtype)
-        )  # (B, 1, latent_goal_hidden)
+        )  # (B, K_anchor, latent_goal_hidden)
 
-        # Denoising token: fuse noisy z with sin-cos time embedding.
+        # Denoising tokens: fuse noisy z with sin-cos time embedding.
         z_emb = self.latent_goal_in_proj(noisy_z.to(self.latent_goal_in_proj.weight.dtype))
         bsize = z_emb.shape[0]
         device = z_emb.device
         dtype = z_emb.dtype
+
+        # Multi-k Option B: add a per-slot k embedding to each denoising
+        # token, indexed by slot // K_anchor. This is the *only* signal
+        # the expert has telling which horizon a given denoising slot
+        # predicts. Single-k path: k_pos_emb is None or unused.
+        if multi_k_b:
+            num_horizons = K_noise // K_anchor
+            k_idx_per_slot = (
+                torch.arange(K_noise, device=device, dtype=torch.long) // K_anchor
+            )  # (K_noise,) values in [0, num_horizons)
+            k_pos = self.latent_goal_k_emb(k_idx_per_slot)  # (K_noise, hidden)
+            k_pos = k_pos.to(dtype=z_emb.dtype)
+            z_emb = z_emb + k_pos[None, :, :]
+        elif self.latent_goal_k_emb is not None:
+            # Legacy multi-k Option A (per-sample k_idx) — still supported
+            # for ckpts trained that way. Adds a single k_emb token after
+            # the anchor block (not inside denoising). When k_idx is None
+            # and Option B isn't engaged, fall through with no k signal
+            # (e.g., inference of a single-k checkpoint that nonetheless
+            # built the k_emb layer).
+            pass  # k_idx-token branch handled below
 
         time_emb = create_sinusoidal_pos_embedding(
             timestep,
@@ -1210,22 +1440,34 @@ class VLAFlowMatching(nn.Module):
             self.config.max_period,
             device=device,
         ).type(dtype=dtype)
-        time_emb = time_emb[:, None, :].expand_as(z_emb)
+        # Broadcast (B, H) → (B, K_noise, H) — time shared per sample.
+        time_emb = time_emb[:, None, :].expand(bsize, K_noise, time_emb.shape[-1])
 
         z_time_emb = torch.cat([z_emb, time_emb], dim=2)
         z_time_emb = self.latent_goal_time_mlp_in(z_time_emb)
         z_time_emb = F.silu(z_time_emb)
         z_time_emb = self.latent_goal_time_mlp_out(z_time_emb)
 
-        # Concat anchor + denoising token into a 2-token Latent Goal Expert suffix.
+        # Concat: anchor (K_anchor) + optional Option-A k_idx token + denoising (K_noise).
         anchor_emb = anchor_emb.to(dtype=z_time_emb.dtype)
-        embs = torch.cat([anchor_emb, z_time_emb], dim=1)  # (B, 2, latent_goal_hidden)
+        parts = [anchor_emb]
+        if (
+            self.latent_goal_k_emb is not None
+            and not multi_k_b
+            and k_idx is not None
+        ):
+            # Legacy Option-A path: single k_emb token between anchor and denoising.
+            k_tok = self.latent_goal_k_emb(k_idx.to(dtype=torch.long))
+            k_tok = k_tok.to(dtype=z_time_emb.dtype).unsqueeze(1)
+            parts.append(k_tok)
+        parts.append(z_time_emb)
+        embs = torch.cat(parts, dim=1)  # (B, K_anchor + [1] + K_noise, hidden)
 
-        pad_mask = torch.ones(bsize, 2, dtype=torch.bool, device=device)
-        # att_mask=[1, 0]: anchor opens a new attention block, denoising
-        # token shares it (same cumsum → bidirectional within Latent Goal Expert).
-        att_mask = torch.tensor([1.0, 0.0], dtype=z_time_emb.dtype, device=device)
-        att_mask = att_mask[None, :].expand(bsize, 2)
+        n_tok = embs.shape[1]
+        pad_mask = torch.ones(bsize, n_tok, dtype=torch.bool, device=device)
+        att_mask_list = [1.0] + [0.0] * (n_tok - 1)
+        att_mask = torch.tensor(att_mask_list, dtype=z_time_emb.dtype, device=device)
+        att_mask = att_mask[None, :].expand(bsize, n_tok)
         return embs, pad_mask, att_mask
 
     def _encode_lewm_emb(
@@ -1260,8 +1502,22 @@ class VLAFlowMatching(nn.Module):
         self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None,
         chunk_end_images: list[torch.Tensor] | None = None,
         chunk_end_pad_mask: torch.Tensor | None = None,
+        chunk_end_state: torch.Tensor | None = None,
+        multi_k_payload: dict | None = None,
     ) -> Tensor:
-        """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
+        """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors).
+
+        ``chunk_end_state`` is the policy state at the chunk-end frame
+        (frame +k from anchor). Required by proprio-in-state JEPAs for
+        encoding the LGE regression target; ignored by JEPAs without
+        ``proprio_enc`` and by runs with LGE disabled.
+
+        ``multi_k_payload`` (multi-k LGE training): dict with
+        ``k_idx``: (B,) long tensor — per-sample k index into the
+        offsets list, used both to select the chunk-end frame upstream
+        and to condition the LGE expert via the k_emb token. None for
+        single-k legacy.
+        """
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
 
@@ -1297,12 +1553,68 @@ class VLAFlowMatching(nn.Module):
                     "latent_goal_inject_to_action=True requires chunk_end_images in "
                     "forward(); observation_delta_indices=[0, chunk_size] should be set."
                 )
-            # NOTE: chunk_end_state isn't currently threaded through forward
-            # — for proprio-in-state JEPAs, encoding chunk_end_images without
-            # the chunk-end proprio raises a clean error from encode_states.
-            # The "baseline-no-LGE" run skips this branch entirely.
-            z_t_anchor = self._encode_lewm_emb(images, state=state)         # (B, 192)
-            z_g_target = self._encode_lewm_emb(chunk_end_images)            # (B, 192)
+            # Encode z_t (anchor) and z_g_target. For multi-k Option B,
+            # chunk_end_images carries 5 horizons concatenated along the
+            # batch axis (shape num_k*B per cam); we encode in ONE JEPA
+            # forward then reshape to (B, num_k, K, D) → (B, num_k*K, D).
+            z_t_anchor = self._encode_lewm_emb(images, state=state)  # (B[,K], D)
+            mk_b = multi_k_payload is not None and "num_horizons" in multi_k_payload
+            if mk_b:
+                num_h = multi_k_payload["num_horizons"]
+                # Encode all 5 horizons in one batched JEPA forward.
+                z_g_stacked = self._encode_lewm_emb(
+                    chunk_end_images, state=chunk_end_state
+                )  # (num_h * B, K, D)  for multi-token JEPA
+                if z_g_stacked.ndim == 2:
+                    # Legacy single-token JEPA — multi-k Option B requires
+                    # multi-token because the LGE expert reads per-token.
+                    raise ValueError(
+                        "Multi-k Option B requires multi-token JEPA "
+                        "(lewm_multi_token=True); got single-token."
+                    )
+                Btot, K_per_h, D = z_g_stacked.shape
+                if Btot % num_h != 0:
+                    raise RuntimeError(
+                        f"chunk_end batch size {Btot} not divisible by num_horizons {num_h}"
+                    )
+                Bs = Btot // num_h
+                # Reshape (num_h*B, K, D) → (num_h, B, K, D) → (B, num_h, K, D)
+                z_g_per_h = z_g_stacked.view(num_h, Bs, K_per_h, D).permute(1, 0, 2, 3).contiguous()
+                # Flatten horizons into the token axis: (B, num_h*K, D)
+                z_g_target = z_g_per_h.reshape(Bs, num_h * K_per_h, D)
+                # Broadcast z_t along horizon axis to match shape.
+                # z_t_anchor: (B, K, D) → (B, 1, K, D) → repeat → (B, num_h*K, D)
+                z_t_broadcast = (
+                    z_t_anchor.unsqueeze(1)
+                    .expand(Bs, num_h, K_per_h, D)
+                    .reshape(Bs, num_h * K_per_h, D)
+                )
+                # k-clamp: for (sample, horizon) pairs where the chunk-end
+                # ran off the episode end, replace z_g with z_t so Δz_g=0
+                # (no-motion target). per_horizon_pad: (B, num_h) bool,
+                # True=invalid. Expand to (B, num_h, 1, 1) for broadcasting.
+                ph_pad = multi_k_payload["per_horizon_pad"]  # (B, num_h)
+                ph_pad_e = ph_pad.view(Bs, num_h, 1, 1).to(dtype=z_g_target.dtype)
+                ph_pad_flat = ph_pad_e.expand(Bs, num_h, K_per_h, D).reshape(
+                    Bs, num_h * K_per_h, D
+                )
+                z_g_target = torch.where(
+                    ph_pad_flat.bool(),
+                    z_t_broadcast.to(z_g_target.dtype),
+                    z_g_target,
+                )
+            else:
+                z_g_target = self._encode_lewm_emb(chunk_end_images, state=chunk_end_state)
+                z_t_broadcast = z_t_anchor  # (B, K, D) or (B, D) — used in SIGReg reconstruct
+
+            # Residual parameterization: LGE predicts Δz_g = z_g - z_t,
+            # so the flow-matching target shifts from z_g to Δz_g. The
+            # noise interpolation pattern is the same.
+            if self.config.latent_goal_residual:
+                # Use z_t_broadcast (matches z_g_target shape in Option B).
+                latent_goal_target = z_g_target - z_t_broadcast
+            else:
+                latent_goal_target = z_g_target
 
             # ── Pass 1: prefix-only forward → VLM K/V cache ──
             prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
@@ -1317,16 +1629,23 @@ class VLAFlowMatching(nn.Module):
             )
 
             # ── Pass 2: LGE forward → flow-matching velocity & loss ──
-            latent_goal_noise = self.sample_noise(z_g_target.shape, z_g_target.device)
-            latent_goal_time = self.sample_time(z_g_target.shape[0], z_g_target.device)
-            latent_goal_t_exp = latent_goal_time[:, None]
+            latent_goal_noise = self.sample_noise(latent_goal_target.shape, latent_goal_target.device)
+            latent_goal_time = self.sample_time(latent_goal_target.shape[0], latent_goal_target.device)
+            # latent_goal_t_exp broadcasts t over (K, D) for multi-token,
+            # over (D,) for single-token — t lives on the batch axis.
+            t_view = (slice(None),) + (None,) * (latent_goal_target.ndim - 1)
+            latent_goal_t_exp = latent_goal_time[t_view]
             latent_goal_x_t = (
-                latent_goal_t_exp * latent_goal_noise + (1 - latent_goal_t_exp) * z_g_target
+                latent_goal_t_exp * latent_goal_noise + (1 - latent_goal_t_exp) * latent_goal_target
             )
-            latent_goal_u_t = latent_goal_noise - z_g_target
+            latent_goal_u_t = latent_goal_noise - latent_goal_target
 
+            # Multi-k k_idx (None for single-k legacy).
+            mk_k_idx = None  # Option B: k signal is per-slot via embed_latent_goal_suffix
             latent_goal_embs, latent_goal_pad_masks, latent_goal_att_masks = (
-                self.embed_latent_goal_suffix(z_t_anchor, latent_goal_x_t, latent_goal_time)
+                self.embed_latent_goal_suffix(
+                    z_t_anchor, latent_goal_x_t, latent_goal_time, k_idx=mk_k_idx
+                )
             )
             pass2_pad = torch.cat([prefix_pad_masks, latent_goal_pad_masks], dim=1)
             pass2_att = torch.cat([prefix_att_masks, latent_goal_att_masks], dim=1)
@@ -1344,12 +1663,26 @@ class VLAFlowMatching(nn.Module):
                 fill_kv_cache=False,
             )
             latent_goal_out = outputs2[2]
+            # The LGE suffix is 2K tokens: K anchor (first half) + K
+            # denoising (last K). Read velocity from the K denoising
+            # positions for multi-token, or the single last position
+            # for the legacy single-token case (K=1 → -1: equivalent to
+            # -K:). Output shape mirrors latent_goal_u_t.
+            K_lge = latent_goal_target.shape[1] if latent_goal_target.ndim == 3 else 1
+            latent_goal_v_raw = latent_goal_out[:, -K_lge:, :]
             latent_goal_v = self.latent_goal_out_proj(
-                latent_goal_out[:, -1, :].to(dtype=torch.float32)
-            )
+                latent_goal_v_raw.to(dtype=torch.float32)
+            )  # (B, K, D) for multi-token, (B, 1, D) for single-token
+            if latent_goal_target.ndim == 2:
+                # Legacy: collapse the singleton K axis to match u_t's (B, D).
+                latent_goal_v = latent_goal_v.squeeze(1)
+
+            # Per-sample loss: mean over (K, D) if multi-token, over D
+            # if single-token. Same reduction either way.
+            reduce_dims = tuple(range(1, latent_goal_u_t.ndim))
             per_sample_fs = F.mse_loss(
                 latent_goal_u_t, latent_goal_v, reduction="none"
-            ).mean(dim=-1)
+            ).mean(dim=reduce_dims)
             if chunk_end_pad_mask is not None:
                 valid = (~chunk_end_pad_mask).to(dtype=per_sample_fs.dtype)
                 denom = valid.sum().clamp_min(1.0)
@@ -1358,86 +1691,161 @@ class VLAFlowMatching(nn.Module):
                 latent_goal_loss = per_sample_fs.mean()
 
             # ── SIGReg on the gradient-connected one-step reconstruction ──
-            # Independent of the Mode 3 ``source`` switch: SIGReg regularizes
-            # LGE's output distribution, not the action expert's conditioning
-            # input. Padded chunk-end samples are dropped to avoid pulling
-            # the marginals toward the padding distribution.
+            # Residual path: reconstruct ẑ_g = z_t + Δẑ_g so SIGReg sees
+            # the same per-token isotropic-Gaussian space that le-wm
+            # regularizes the JEPA toward (see le-wm/train.py:690-698).
+            # Absolute path: reconstruct ẑ_g directly from the velocity.
+            # Multi-token follows le-wm's "Plan B design lock":
+            # ``rearrange(b k d -> 1 (b k) d)`` — K becomes extra samples
+            # along the batch axis. Single-token keeps the legacy
+            # ``unsqueeze(0)`` shape.
             if self.latent_goal_sigreg is not None:
-                z_g_pred_for_sigreg = (
+                # One-step closed-form reconstruction of the target:
+                #   target_pred = x_t - t * v
+                # Residual path: target is Δz_g → ẑ_g = z_t + (x_t - t*v).
+                # Absolute path: target is z_g    → ẑ_g = (x_t - t*v).
+                target_pred = (
                     latent_goal_x_t.to(dtype=torch.float32)
                     - latent_goal_t_exp.to(dtype=torch.float32) * latent_goal_v
                 )
+                if self.config.latent_goal_residual:
+                    z_t_for_sig = z_t_anchor.to(dtype=torch.float32)
+                    # Multi-k Option B: broadcast z_t (K=18) along the
+                    # horizon axis to match target_pred (K=18*num_h).
+                    if (
+                        z_t_for_sig.ndim == 3
+                        and target_pred.ndim == 3
+                        and target_pred.shape[1] > z_t_for_sig.shape[1]
+                        and target_pred.shape[1] % z_t_for_sig.shape[1] == 0
+                    ):
+                        Bs_, K_, D_ = z_t_for_sig.shape
+                        num_h_ = target_pred.shape[1] // K_
+                        z_t_for_sig = (
+                            z_t_for_sig.unsqueeze(1)
+                            .expand(Bs_, num_h_, K_, D_)
+                            .reshape(Bs_, num_h_ * K_, D_)
+                        )
+                    z_g_pred_for_sigreg = z_t_for_sig + target_pred
+                else:
+                    z_g_pred_for_sigreg = target_pred
                 if chunk_end_pad_mask is not None:
                     keep = ~chunk_end_pad_mask
                     if keep.any():
                         z_g_pred_for_sigreg = z_g_pred_for_sigreg[keep]
                 if z_g_pred_for_sigreg.shape[0] > 0:
-                    latent_goal_sigreg_loss = self.latent_goal_sigreg(
-                        z_g_pred_for_sigreg.unsqueeze(0)
-                    )
+                    if z_g_pred_for_sigreg.ndim == 3:
+                        # Multi-token: (B, K, D) → (T=1, B*K, D) — K becomes
+                        # batch-axis samples per le-wm's pattern.
+                        from einops import rearrange as _rearr
+                        sigreg_in = _rearr(z_g_pred_for_sigreg, "b k d -> 1 (b k) d")
+                    else:
+                        sigreg_in = z_g_pred_for_sigreg.unsqueeze(0)  # (1, B, D)
+                    latent_goal_sigreg_loss = self.latent_goal_sigreg(sigreg_in)
 
-            # ── Build z_g for the action expert ──
+            # ── Build z_g (or Δz_g, in residual mode) for the action expert ──
+            # In residual mode the LGE outputs Δz_g, and the action-expert
+            # injection bank carries the residual directly (no need to
+            # reconstruct ẑ_g for injection — the WM side-channel tokens
+            # already convey z_t to the action expert). SIGReg already
+            # used the reconstructed ẑ_g above; that's the only place
+            # the absolute goal is rebuilt.
             source = self.config.latent_goal_inject_z_g_source
             if source == "encoded":
-                z_g_for_action = z_g_target
+                z_g_or_dz_for_action = latent_goal_target  # = Δz_g (residual) or z_g (absolute)
             else:
-                # ``predicted`` and ``scheduled`` both need the predicted
-                # latent. ``scheduled`` additionally mixes per-sample
-                # with z_g_target via a Bernoulli mask whose probability
-                # ramps from 0 → 1 across training.
                 if self.config.latent_goal_train_num_steps > 1:
                     # K-step iterative denoise — matches the inference
                     # loop exactly so the action expert sees the same
-                    # z_g distribution at train and eval. Runs under
-                    # no_grad because z_g is detached on the action-expert
-                    # side; the LGE flow-matching signal still comes
-                    # from the Pass 2 single-t forward above
-                    # (latent_goal_v).
+                    # target distribution at train and eval. Runs under
+                    # no_grad because the action-expert side detaches.
+                    # In residual mode this denoise returns Δẑ_g.
+                    # Multi-k Option B: target has 5×K denoising slots,
+                    # pass a (B, num_h*K, D) template so the noise init
+                    # matches.
                     with torch.no_grad():
-                        z_g_predicted = self._latent_goal_denoise(
-                            z_t_anchor, prefix_pad_masks, past_key_values
+                        target_predicted = self._latent_goal_denoise(
+                            z_t_anchor, prefix_pad_masks, past_key_values,
+                            k_idx=mk_k_idx,
+                            noise_shape_template=latent_goal_target
+                            if (
+                                latent_goal_target.ndim == 3
+                                and z_t_anchor.ndim == 3
+                                and latent_goal_target.shape[1] > z_t_anchor.shape[1]
+                            ) else None,
                         )
                 else:
-                    # One-step closed-form reconstruction.
-                    # Flow matching: x_t = t·noise + (1-t)·z_g  and  v = noise − z_g
-                    #   ⇒  z_g_pred = x_t − t · v
-                    z_g_predicted = (
+                    # One-step closed-form reconstruction of the target:
+                    # Flow matching: x_t = t·noise + (1-t)·tgt  and  v = noise − tgt
+                    #   ⇒  tgt_pred = x_t − t · v
+                    target_predicted = (
                         latent_goal_x_t.to(dtype=torch.float32)
                         - latent_goal_t_exp.to(dtype=torch.float32) * latent_goal_v
                     )
 
                 if source == "scheduled":
-                    # Per-sample Bernoulli mix:
-                    #   p = clamp((step - start_step) / (end_step - start_step), 0, 1)
-                    # mask=1 → use predicted (student); mask=0 → encoded (teacher).
-                    # Validation enforces 0 <= start_step < end_step, so
-                    # the denominator is always positive.
                     step = int(self._train_step.item())
                     start = self.config.latent_goal_inject_schedule_start_step
                     end = self.config.latent_goal_inject_schedule_end_step
                     p = min(1.0, max(0.0, (step - start) / (end - start)))
-                    bsize = z_g_target.shape[0]
-                    u = torch.rand(bsize, device=z_g_target.device)
-                    use_predicted = (u < p).to(dtype=z_g_target.dtype).unsqueeze(-1)  # (B, 1)
-                    z_g_for_action = (
-                        use_predicted * z_g_predicted.to(dtype=z_g_target.dtype)
-                        + (1.0 - use_predicted) * z_g_target
+                    bsize_lge = latent_goal_target.shape[0]
+                    u = torch.rand(bsize_lge, device=latent_goal_target.device)
+                    # Shape-aware mask: (B, 1) for 2D, (B, 1, 1) for 3D.
+                    mask_view = (slice(None),) + (None,) * (latent_goal_target.ndim - 1)
+                    use_predicted = (u < p).to(dtype=latent_goal_target.dtype)[mask_view]
+                    z_g_or_dz_for_action = (
+                        use_predicted * target_predicted.to(dtype=latent_goal_target.dtype)
+                        + (1.0 - use_predicted) * latent_goal_target
                     )
                 else:
-                    z_g_for_action = z_g_predicted
+                    z_g_or_dz_for_action = target_predicted
 
-            z_t_for_action = z_t_anchor
             if self.config.latent_goal_inject_detach:
-                z_t_for_action = z_t_for_action.detach()
-                z_g_for_action = z_g_for_action.detach()
+                z_g_or_dz_for_action = z_g_or_dz_for_action.detach()
 
-            zt_emb = self.latent_goal_action_zt_proj(
-                z_t_for_action.to(self.latent_goal_action_zt_proj.weight.dtype)
-            )
-            zg_emb = self.latent_goal_action_zg_proj(
-                z_g_for_action.to(self.latent_goal_action_zg_proj.weight.dtype)
-            )
-            latent_goal_inject = torch.stack([zt_emb, zg_emb], dim=1)  # (B, 2, hidden)
+            if self.config.latent_goal_residual:
+                # Action expert reads the reconstructed absolute
+                # ẑ_g = z_t + Δẑ_g. For multi-k Option B, ẑ_g is
+                # (B, num_h*K, D) and z_t is (B, K, D) — broadcast
+                # z_t along the horizon axis first.
+                z_t_for_inject = z_t_anchor.to(z_g_or_dz_for_action.dtype)
+                if mk_b and z_g_or_dz_for_action.ndim == 3 and z_t_for_inject.ndim == 3:
+                    num_h_inj = z_g_or_dz_for_action.shape[1] // z_t_for_inject.shape[1]
+                    if num_h_inj * z_t_for_inject.shape[1] == z_g_or_dz_for_action.shape[1]:
+                        K_ = z_t_for_inject.shape[1]
+                        z_t_for_inject = (
+                            z_t_for_inject.unsqueeze(1)
+                            .expand(-1, num_h_inj, K_, -1)
+                            .reshape(z_g_or_dz_for_action.shape[0], num_h_inj * K_, -1)
+                        )
+                zg_for_inject = z_t_for_inject + z_g_or_dz_for_action
+                if zg_for_inject.ndim == 2:
+                    zg_for_inject = zg_for_inject.unsqueeze(1)  # (B, 1, D)
+                # Projector name kept as ``dz_proj`` for checkpoint compat;
+                # semantically an absolute-z_g projector.
+                latent_goal_inject = self.latent_goal_action_dz_proj(
+                    zg_for_inject.to(self.latent_goal_action_dz_proj.weight.dtype)
+                )  # (B, num_h*K, action_hidden) for multi-k Option B
+            else:
+                # Legacy: [z_t_tok, z_g_tok] = 2 tokens. Requires
+                # single-token (D-axis only) z_t / z_g.
+                z_t_for_action = z_t_anchor
+                if self.config.latent_goal_inject_detach:
+                    z_t_for_action = z_t_for_action.detach()
+                if z_t_for_action.ndim == 3 or z_g_or_dz_for_action.ndim == 3:
+                    raise ValueError(
+                        "Legacy non-residual LGE-mode-3 injection requires "
+                        "single-token JEPA (z_t/z_g shape (B, D)). Got "
+                        f"z_t.ndim={z_t_for_action.ndim}, "
+                        f"z_g.ndim={z_g_or_dz_for_action.ndim}. Enable "
+                        "latent_goal_residual=True for multi-token JEPAs."
+                    )
+                zt_emb = self.latent_goal_action_zt_proj(
+                    z_t_for_action.to(self.latent_goal_action_zt_proj.weight.dtype)
+                )
+                zg_emb = self.latent_goal_action_zg_proj(
+                    z_g_or_dz_for_action.to(self.latent_goal_action_zg_proj.weight.dtype)
+                )
+                latent_goal_inject = torch.stack([zt_emb, zg_emb], dim=1)  # (B, 2, hidden)
 
             # ── Pass 3: action expert forward with z_t/z_g prepended ──
             suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(
@@ -1476,19 +1884,28 @@ class VLAFlowMatching(nn.Module):
             suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(
                 x_t, time, suffix_lewm
             )
-            z_t_anchor = self._encode_lewm_emb(images, state=state)     # (B, 192)
-            z_g_target = self._encode_lewm_emb(chunk_end_images)        # (B, 192)
+            z_t_anchor = self._encode_lewm_emb(images, state=state)                    # (B[,K], D)
+            z_g_target = self._encode_lewm_emb(chunk_end_images, state=chunk_end_state)# (B[,K], D)
 
-            latent_goal_noise = self.sample_noise(z_g_target.shape, z_g_target.device)
-            latent_goal_time = self.sample_time(z_g_target.shape[0], z_g_target.device)
-            latent_goal_t_exp = latent_goal_time[:, None]
+            if self.config.latent_goal_residual:
+                latent_goal_target = z_g_target - z_t_anchor
+            else:
+                latent_goal_target = z_g_target
+
+            latent_goal_noise = self.sample_noise(latent_goal_target.shape, latent_goal_target.device)
+            latent_goal_time = self.sample_time(latent_goal_target.shape[0], latent_goal_target.device)
+            t_view = (slice(None),) + (None,) * (latent_goal_target.ndim - 1)
+            latent_goal_t_exp = latent_goal_time[t_view]
             latent_goal_x_t = (
-                latent_goal_t_exp * latent_goal_noise + (1 - latent_goal_t_exp) * z_g_target
+                latent_goal_t_exp * latent_goal_noise + (1 - latent_goal_t_exp) * latent_goal_target
             )
-            latent_goal_u_t = latent_goal_noise - z_g_target
+            latent_goal_u_t = latent_goal_noise - latent_goal_target
 
+            mk_k_idx = None  # Option B: k signal is per-slot via embed_latent_goal_suffix
             latent_goal_embs, latent_goal_pad_masks, latent_goal_att_masks = (
-                self.embed_latent_goal_suffix(z_t_anchor, latent_goal_x_t, latent_goal_time)
+                self.embed_latent_goal_suffix(
+                    z_t_anchor, latent_goal_x_t, latent_goal_time, k_idx=mk_k_idx
+                )
             )
 
             pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks, latent_goal_pad_masks], dim=1)
@@ -1517,12 +1934,18 @@ class VLAFlowMatching(nn.Module):
             v_t = self.action_out_proj(action_suffix_out)
             losses = F.mse_loss(u_t, v_t, reduction="none")
 
+            # Read velocity from the K denoising positions (or single
+            # token for legacy). Mirrors the Mode 3 extraction.
+            K_lge_a = latent_goal_target.shape[1] if latent_goal_target.ndim == 3 else 1
             latent_goal_v = self.latent_goal_out_proj(
-                latent_goal_out[:, -1, :].to(dtype=torch.float32)
+                latent_goal_out[:, -K_lge_a:, :].to(dtype=torch.float32)
             )
+            if latent_goal_target.ndim == 2:
+                latent_goal_v = latent_goal_v.squeeze(1)
+            reduce_dims = tuple(range(1, latent_goal_u_t.ndim))
             per_sample_fs = F.mse_loss(
                 latent_goal_u_t, latent_goal_v, reduction="none"
-            ).mean(dim=-1)
+            ).mean(dim=reduce_dims)
             if chunk_end_pad_mask is not None:
                 valid = (~chunk_end_pad_mask).to(dtype=per_sample_fs.dtype)
                 denom = valid.sum().clamp_min(1.0)
@@ -1531,21 +1954,43 @@ class VLAFlowMatching(nn.Module):
                 latent_goal_loss = per_sample_fs.mean()
 
             # ── SIGReg on the gradient-connected one-step reconstruction ──
-            # Same regularizer as in Mode 3 (drop padded chunk-ends so the
-            # marginals aren't pulled toward the padding distribution).
+            # Same regularizer pattern as Mode 3: residual reconstructs
+            # ẑ_g = z_t + (x_t - t·v); multi-token rearranges (B, K, D)
+            # → (1, B*K, D) per le-wm's Plan-B lock.
             if self.latent_goal_sigreg is not None:
-                z_g_pred_for_sigreg = (
+                target_pred = (
                     latent_goal_x_t.to(dtype=torch.float32)
                     - latent_goal_t_exp.to(dtype=torch.float32) * latent_goal_v
                 )
+                if self.config.latent_goal_residual:
+                    z_t_for_sig = z_t_anchor.to(dtype=torch.float32)
+                    if (
+                        z_t_for_sig.ndim == 3
+                        and target_pred.ndim == 3
+                        and target_pred.shape[1] > z_t_for_sig.shape[1]
+                        and target_pred.shape[1] % z_t_for_sig.shape[1] == 0
+                    ):
+                        Bs_, K_, D_ = z_t_for_sig.shape
+                        num_h_ = target_pred.shape[1] // K_
+                        z_t_for_sig = (
+                            z_t_for_sig.unsqueeze(1)
+                            .expand(Bs_, num_h_, K_, D_)
+                            .reshape(Bs_, num_h_ * K_, D_)
+                        )
+                    z_g_pred_for_sigreg = z_t_for_sig + target_pred
+                else:
+                    z_g_pred_for_sigreg = target_pred
                 if chunk_end_pad_mask is not None:
                     keep = ~chunk_end_pad_mask
                     if keep.any():
                         z_g_pred_for_sigreg = z_g_pred_for_sigreg[keep]
                 if z_g_pred_for_sigreg.shape[0] > 0:
-                    latent_goal_sigreg_loss = self.latent_goal_sigreg(
-                        z_g_pred_for_sigreg.unsqueeze(0)
-                    )
+                    if z_g_pred_for_sigreg.ndim == 3:
+                        from einops import rearrange as _rearr
+                        sigreg_in = _rearr(z_g_pred_for_sigreg, "b k d -> 1 (b k) d")
+                    else:
+                        sigreg_in = z_g_pred_for_sigreg.unsqueeze(0)
+                    latent_goal_sigreg_loss = self.latent_goal_sigreg(sigreg_in)
 
         else:
             suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(
@@ -1615,21 +2060,92 @@ class VLAFlowMatching(nn.Module):
         latent_goal_inject_tokens: torch.Tensor | None = None
         z_t_emb: torch.Tensor | None = None
         z_g_emb: torch.Tensor | None = None
+        # Multi-k Option B detection: target_offsets is non-empty and
+        # the LGE was built with k_emb. At inference we predict ALL
+        # horizons in one denoise loop (90 tokens out for 5 horizons ×
+        # K_per_horizon=18). The k-signal is per-slot via
+        # embed_latent_goal_suffix.
+        mk_b_inf = (
+            self.latent_goal_k_emb is not None
+            and bool(self.config.parsed_latent_goal_target_offsets)
+        )
+        num_horizons_inf = (
+            len(self.config.parsed_latent_goal_target_offsets) if mk_b_inf else 0
+        )
+
         if mode3:
             z_t_emb = self._encode_lewm_emb(images, state=state)
-            z_g_emb = self._latent_goal_denoise(z_t_emb, prefix_pad_masks, past_key_values)
-            zt_tok = self.latent_goal_action_zt_proj(
-                z_t_emb.to(self.latent_goal_action_zt_proj.weight.dtype)
-            )
-            zg_tok = self.latent_goal_action_zg_proj(
-                z_g_emb.to(self.latent_goal_action_zg_proj.weight.dtype)
-            )
-            latent_goal_inject_tokens = torch.stack([zt_tok, zg_tok], dim=1)
+
+            # For multi-k Option B, the LGE denoise loop initializes
+            # noise of shape (B, num_horizons * K, D) instead of
+            # (B, K, D), so the loop's velocity field predicts all
+            # horizons simultaneously. _latent_goal_denoise inspects
+            # its input shape to pick noise dimensionality.
+            if mk_b_inf and z_t_emb.ndim == 3:
+                Bs, K_per_h, D = z_t_emb.shape
+                # Build a placeholder anchor with the "expanded" K so
+                # the noise sampler matches. The actual anchor passed
+                # to LGE remains z_t_emb (K=18) — embed_latent_goal_suffix
+                # detects the K_anchor < K_noise asymmetry and adds the
+                # per-slot k_pos_emb to the K_noise denoising tokens.
+                noise_shape_template = z_t_emb.new_empty(
+                    Bs, num_horizons_inf * K_per_h, D
+                )
+                denoised = self._latent_goal_denoise(
+                    z_t_emb,
+                    prefix_pad_masks,
+                    past_key_values,
+                    noise_shape_template=noise_shape_template,
+                )  # (B, num_h * K, D)
+                # Reconstruct: broadcast z_t along horizon axis and add.
+                z_t_broadcast_inf = (
+                    z_t_emb.unsqueeze(1)
+                    .expand(Bs, num_horizons_inf, K_per_h, D)
+                    .reshape(Bs, num_horizons_inf * K_per_h, D)
+                )
+                z_g_emb = (
+                    z_t_broadcast_inf + denoised
+                    if self.config.latent_goal_residual
+                    else denoised
+                )
+                # Project ALL horizon banks for action expert.
+                zg_for_inject = z_g_emb
+                latent_goal_inject_tokens = self.latent_goal_action_dz_proj(
+                    zg_for_inject.to(self.latent_goal_action_dz_proj.weight.dtype)
+                )  # (B, num_h*K, action_hidden)
+            else:
+                # Single-k legacy / Option B disabled.
+                denoised = self._latent_goal_denoise(
+                    z_t_emb, prefix_pad_masks, past_key_values
+                )
+                if self.config.latent_goal_residual:
+                    z_g_emb = z_t_emb + denoised
+                    zg_for_inject = z_g_emb
+                    if zg_for_inject.ndim == 2:
+                        zg_for_inject = zg_for_inject.unsqueeze(1)
+                    latent_goal_inject_tokens = self.latent_goal_action_dz_proj(
+                        zg_for_inject.to(self.latent_goal_action_dz_proj.weight.dtype)
+                    )
+                else:
+                    z_g_emb = denoised
+                    if z_t_emb.ndim == 3 or z_g_emb.ndim == 3:
+                        raise ValueError(
+                            "Legacy non-residual LGE-mode-3 injection requires "
+                            "single-token JEPA. Enable latent_goal_residual=True."
+                        )
+                    zt_tok = self.latent_goal_action_zt_proj(
+                        z_t_emb.to(self.latent_goal_action_zt_proj.weight.dtype)
+                    )
+                    zg_tok = self.latent_goal_action_zg_proj(
+                        z_g_emb.to(self.latent_goal_action_zg_proj.weight.dtype)
+                    )
+                    latent_goal_inject_tokens = torch.stack([zt_tok, zg_tok], dim=1)
         elif self.config.mpc_enabled:
-            # MPC without Mode 3 still needs both anchors for predictor
-            # rollout + scoring. Compute them here on the same cache.
+            # MPC needs absolute z_g — for multi-k Option B it would need
+            # a strategy for using 5 banks for scoring (not yet wired).
             z_t_emb = self._encode_lewm_emb(images, state=state)
-            z_g_emb = self._latent_goal_denoise(z_t_emb, prefix_pad_masks, past_key_values)
+            denoised = self._latent_goal_denoise(z_t_emb, prefix_pad_masks, past_key_values)
+            z_g_emb = z_t_emb + denoised if self.config.latent_goal_residual else denoised
 
         return {
             "bsize": bsize,
@@ -2192,26 +2708,40 @@ class VLAFlowMatching(nn.Module):
         z_t_anchor: torch.Tensor,
         prefix_pad_masks: torch.Tensor,
         past_key_values,
+        k_idx: torch.Tensor | None = None,
+        noise_shape_template: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """K-step flow-matching denoising of the LGE goal latent at inference.
+        """K-step flow-matching denoising of the LGE target at inference.
 
-        Produces a clean ``z_g`` (B, 192) by initializing from Gaussian
-        noise at t=1 and integrating the LGE velocity field down to t=0
-        with ``num_steps=config.latent_goal_num_steps``. Reuses the
-        prefix VLM K/V cache that was built before action denoising
-        starts, so the only marginal cost vs Phase A is the LGE expert
-        forwards (one per denoising step).
+        In residual mode this produces Δẑ_g (the residual from current
+        observation to chunk-end goal); in absolute mode it produces
+        ẑ_g directly. Caller decides what to do with the result.
+
+        Initializes from Gaussian noise matching ``z_t_anchor.shape``
+        (legacy ``(B, D)`` single-token or ``(B, K, D)`` multi-token)
+        and integrates the LGE velocity field down to t=0 with
+        ``num_steps=config.latent_goal_num_steps``. Reuses the prefix
+        VLM K/V cache, so the only marginal cost is the LGE expert
+        forwards.
         """
-        bsize = z_t_anchor.shape[0]
         device = z_t_anchor.device
-        latent_dim = z_t_anchor.shape[-1]
-        z = self.sample_noise((bsize, latent_dim), device)
+        bsize = z_t_anchor.shape[0]
+        # Multi-k Option B: noise has more denoising slots than the
+        # anchor (e.g., 90 vs 18 for 5 horizons × 18 per state). The
+        # caller passes a (B, num_h*K, D) template; otherwise we use
+        # the anchor's shape (single-k legacy).
+        if noise_shape_template is not None:
+            z = self.sample_noise(noise_shape_template.shape, device)
+        else:
+            z = self.sample_noise(z_t_anchor.shape, device)
         num_steps = self.config.latent_goal_num_steps
         dt = -1.0 / num_steps
         for step in range(num_steps):
             t_scalar = 1.0 + step * dt
             t = torch.tensor(t_scalar, dtype=torch.float32, device=device).expand(bsize)
-            v = self._latent_goal_denoise_step(z_t_anchor, z, t, prefix_pad_masks, past_key_values)
+            v = self._latent_goal_denoise_step(
+                z_t_anchor, z, t, prefix_pad_masks, past_key_values, k_idx=k_idx
+            )
             z = z + dt * v
         return z
 
@@ -2222,12 +2752,13 @@ class VLAFlowMatching(nn.Module):
         timestep: torch.Tensor,
         prefix_pad_masks: torch.Tensor,
         past_key_values,
+        k_idx: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """One LGE denoising step. Mirrors the action ``denoise_step`` plumbing
         for the LGE suffix; emits the velocity at the denoising token
         position."""
         latent_goal_embs, latent_goal_pad_masks, latent_goal_att_masks = (
-            self.embed_latent_goal_suffix(z_t_anchor, noisy_z, timestep)
+            self.embed_latent_goal_suffix(z_t_anchor, noisy_z, timestep, k_idx=k_idx)
         )
         suffix_len = latent_goal_pad_masks.shape[1]
         batch_size = prefix_pad_masks.shape[0]
@@ -2247,4 +2778,13 @@ class VLAFlowMatching(nn.Module):
             fill_kv_cache=False,
         )
         latent_goal_out = outputs[2]
-        return self.latent_goal_out_proj(latent_goal_out[:, -1, :].to(dtype=torch.float32))
+        # The LGE suffix is 2K tokens (K anchor + K denoising). Read
+        # velocity from the K denoising positions; for legacy K=1 this
+        # is the single last token. Return shape matches noisy_z's
+        # native rank: (B, D) for legacy, (B, K, D) for multi-token.
+        K_lge = noisy_z.shape[1] if noisy_z.ndim == 3 else 1
+        v_raw = latent_goal_out[:, -K_lge:, :].to(dtype=torch.float32)
+        v = self.latent_goal_out_proj(v_raw)
+        if noisy_z.ndim == 2:
+            v = v.squeeze(1)
+        return v
