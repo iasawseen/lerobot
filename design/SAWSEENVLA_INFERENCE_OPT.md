@@ -13,7 +13,9 @@ The measured profile is unambiguous: **the K=10 denoise loop is 179 ms of the 21
 | # | Lever | Target | Latency payoff (bs=1) | Memory payoff | Accuracy risk | Cost | Platform |
 |---|---|---|---|---|---|---|---|
 | 1 | **Flow-head distillation to 1–2 NFE** (SnapFlow-style self-distill) | 82% | **218 → ~57 ms (K=1), −74%**; K=2 measured 74 ms (−66%) | none | ~neutral (+1 pt LIBERO reported on the teacher class); a few pts on hardest tasks at K=1 | ~12 GPU-h, ~few-hundred LOC | both |
+| | *↳ MEASURED (§1·E): unnecessary on `libero_spatial` — plain K=1 is already SR-neutral (79% vs 75%), no distillation. Keep as insurance for harder suites only.* | | | | | | |
 | 2 | **Static KV-cache + CUDA-graph the denoise step** | 82% | removes Python/launch overhead × K; large at bs=1 — pending profile | none | none | medium (StaticCache prerequisite) | both |
+| | *↳ MEASURED (§1·E): **done — 55.7 → 25.4 ms (2.20×), bit-exact.** Shipped via a two-graph design with NO StaticCache refactor; the prerequisite was sidestepped, not required.* | | | | | | |
 | 3 | **SDPA/FlashAttention-2 in the expert** (replace eager fp32-upcast attn) | 82%+18% | cuts the dominant per-step matmul, both prefix & denoise | small | none | low | both |
 | 4 | **Higher-order / scheduled ODE solver** (Heun, DPM-Solver, non-uniform t) | 82% | K=10 → ~4–6 at matched quality, **~1.5–2.5×**, training-free | none | ~0 (ceiling ≈ K≈4) | very low | both — do first |
 | 5 | **INT8-via-TensorRT (expert MLP/DiT blocks)** | 82% | conditional; **benchmark per-block — INT8 can regress vs FP16 on transformer/control-flow graphs** | weights ½ | validate closed-loop | high | Orin first |
@@ -24,6 +26,33 @@ The measured profile is unambiguous: **the K=10 denoise loop is 179 ms of the 21
 Stacking note: #1, #2, #3, #4 operate on different graph regions and **multiply**. #6 is orthogonal (memory). #1 and an OFT-style L1 head are *mutually exclusive* routes to one forward pass — pick one (keep flow + distill for multimodal contact-rich tasks).
 
 **The one-line strategy:** distillation/step-reduction is the *latency* lever (82%); quantization is the *memory* lever (Orin unified pool). Conflating them is the standard mistake this profile rules out.
+
+---
+
+## 1·E. Measured outcome (2026-06-24, reference SawSeenVLA `libero_spatial_4k_bs96`, 3090 Ti, bs=1)
+
+The plan was executed end-to-end. **The 82/18 diagnosis held and the ranking was directionally right — but two predictions were overturned, both in our favor, collapsing the critical path to two zero-GPU-h levers.**
+
+**Result: 218 ms → 25.4 ms (8.6×), bit-exact to eager (max |Δ| = 0.000000), SR 79.0% over 100 `libero_spatial` episodes vs 75% K=10 baseline — no regression, slightly above.** Both deployment goals (≤30 ms, SR drop ≤5%) met with **zero training and zero GPU-h.**
+
+| stage | latency (bs=1) | SR (libero_spatial, 100 ep) | lever |
+|---|---:|---|---|
+| Baseline K=10 eager | 218 ms | 75% | — |
+| K=1 eager | **55.7 ± 0.6 ms** | 77% | drop denoise steps (§3, free) — *matches the doc's K-sweep prediction of 57 ms* |
+| K=1 + step CUDA-graph | 40.5 ms | bit-exact to eager K=1 | graph the denoise step (≤50 ms milestone) |
+| **K=1 + two-graph (fwd+step)** | **25.4 ± 0.1 ms** | **79%** | + graph the VLM prefix forward |
+
+Speedups: two-graph is **2.20× over eager K=1**, **8.6× over the K=10 baseline.** Only the SmolVLM vision encode (~15 ms) stays eager.
+
+**Surprise 1 — K=1 is free on this model; the SnapFlow distillation headline (§3.2, lever #1, ~12 GPU-h) was unnecessary for `libero_spatial`.** The reference flow head collapses to a single Euler step with *no* quality loss: K=1 scores 77–79% vs 75% at K=10. The doc's hedge — "the last step 2→1 is where multimodal tasks lose a few points" — did not bite here. Distillation therefore drops from *headline* to *insurance for the hardest suites*: verify K=1 SR per-suite (object/goal/10) before deploying K=1 there, and keep K=2–3 only where a suite actually regresses. For `libero_spatial`, K-reduction alone delivered the entire 82% denoise-loop win at no cost — confirming §3.5's "10→1 near-zero on well-distilled tasks" at the favorable end.
+
+**Surprise 2 — CUDA-graphs shipped *without* the StaticCache refactor §4.1 called a "blocking prerequisite."** The `torch.cat`-based dynamic cache (`smolvlm_with_expert.py:276`) was **sidestepped, not fixed**, by a **two-graph design**: graph 1 runs the VLM prefix forward (`fill_kv_cache=True`) and copies its K/V *in-place* into a persistent `static_cache`; graph 2 runs the K-step denoise loop reading that cache. Because the cache buffer is allocated once and only ever written in-place, both regions capture cleanly — no `StaticCache` class, no `torch.cat` removal on the inference path. The two graphs share the static cache; per call, fresh prefix embeddings/masks/positions are copied into graph 1's static input buffers, both graphs replay, and the Euler update `x_t += dt·v_t` runs in Python between step replays. Verified **bit-exact** and **correctly input-sensitive** (a 2-input diagnostic confirmed the forward graph recomputes K/V per input rather than replaying stale values — an earlier *single combined-graph* attempt failed exactly here, scoring 26% SR, which is what motivated splitting into two graphs).
+
+**Two null results that confirm the regime diagnosis (the §4.1 Nsight go/no-go, resolved empirically):**
+- **SDPA in the expert (§4.2, ranked #3) gave ~0 at bs=1.** The per-step cost is `cudaLaunchKernel` + Python dispatch, *not* the attention matmul — overhead-bound, not compute-bound — so a faster kernel buys nothing until the launches themselves are removed (which CUDA-graphs do). Kept as an opt-in env gate (`SAWSEEN_ATTN=sdpa`) for the batched/compute-bound regime where it should help.
+- **`torch.compile(mode="reduce-overhead")` on the whole model gave 0** — it graph-broke on the dict-typed KV-cache (option (2) in §4.1). The **manual two-graph capture (option (3)) was therefore the necessary path, not a fallback.**
+
+**Net correction to the roadmap (§9):** for `libero_spatial` the binding sequence was **K-reduction (free) → manual two-graph CUDA capture (no StaticCache, no retrain) → 25.4 ms.** Distillation (#4), SDPA (#3), `torch.compile`, and the StaticCache refactor were *not* on the critical path. Implementation is gated behind `SAWSEEN_CUDAGRAPH=1` (inference-only, RTC-disabled) in `sawseenvla/modeling_sawseenvla.py` (`_sample_actions_graphed` / `_capture_inference_graphs`); the `embed_suffix` per-step host→device sync (`torch.tensor(att_masks)`) was also replaced with a native `torch.ones` so the step is capturable. **Still open:** Orin re-measurement (§7 estimates unverified on-device), and per-suite K=1 SR for the harder LIBERO suites.
 
 ---
 
@@ -101,7 +130,13 @@ The 10→2 cut is essentially free; the last step 2→1 is where multimodal task
 
 **Why this is the structural match.** At bs=1 the GPU finishes each small expert kernel faster than the CPU can dispatch the next, so the 17.9 ms/step is partly `cudaLaunchKernel` + Python overhead, not FLOPs. The denoise loop is **static-shape, static-K, no growing KV** (the prefix is fixed at `fill_kv_cache=True` and never extends during the loop) — strictly *easier* to graph-capture than an LLM decode. The most directly analogous precedent is Vrushank Desai's diffusion-policy denoise loop **on an RTX 3090**: **~3.4× over eager, ~2.65× over torch.compile**, "the vast majority" from CUDA graphs (+ a custom Conv1d kernel — the conv half won't transfer to a transformer expert, so treat the transferable win as the launch-overhead removal alone). PyTorch's own case studies show graphed sub-regions ~5× faster, gains largest at small batch.
 
-**Prerequisite (blocking).** The cache is currently dynamic — `smolvlm_with_expert.py:276` does `torch.cat([past_key_values[...], key_states])` on the `fill_kv_cache=False` path. The in-code TODO (`:272`) names the fix: preallocate a `StaticCache` with `max_len` declared up front (one cudaMalloc), no per-step `torch.cat`. Static shapes are a hard requirement for graph capture. **This is the unlock for both manual `torch.cuda.graph` capture of the whole K-loop and `torch.compile(mode="reduce-overhead")`.**
+**Prerequisite (blocking) — *overturned, see MEASURED below*.** The cache is currently dynamic — `smolvlm_with_expert.py:276` does `torch.cat([past_key_values[...], key_states])` on the `fill_kv_cache=False` path. The in-code TODO (`:272`) names the fix: preallocate a `StaticCache` with `max_len` declared up front (one cudaMalloc), no per-step `torch.cat`. Static shapes are a hard requirement for graph capture. **This is the unlock for both manual `torch.cuda.graph` capture of the whole K-loop and `torch.compile(mode="reduce-overhead")`.**
+
+> **MEASURED (2026-06-24) — shipped, and the "blocking prerequisite" was *not* needed.** Result: **55.7 → 25.4 ms (2.20×), bit-exact (Δ=0.000000), SR 79%** (§1·E). Two findings correct this section:
+> - **No StaticCache refactor.** Instead of making the *inference cache* static in-place, a **two-graph design** makes the *captured region's* cache static: graph 1 (VLM prefix forward, `fill_kv_cache=True`) writes a once-allocated persistent `static_cache` in-place; graph 2 (denoise step) reads it. The `torch.cat` dynamic path is never on the captured inference loop, so it never needed removing. (`StaticCache` is still the cleaner long-term refactor and would let a *single* graph span both regions — but it was not required to ship.)
+> - **`torch.compile(reduce-overhead)` (option (2)) does NOT work** — it graph-breaks on the dict-typed KV-cache, 0 gain. The **manual capture (option (3)) is the necessary path.**
+> - **A single combined graph over forward+step fails** (26% SR — the captured forward replays stale K/V for new inputs). **Splitting into two chained graphs** (forward recomputes into the shared cache, step reads it) is what makes it bit-exact. A 2-input diagnostic is the right correctness test.
+> - The `embed_suffix` step had a hidden capture-blocker: `att_masks = torch.tensor(python_list, device=...)` is a per-step host→device sync. Replaced with native `torch.ones(...)`. Implementation: `sawseenvla/modeling_sawseenvla.py:_sample_actions_graphed/_capture_inference_graphs`, gated `SAWSEEN_CUDAGRAPH=1`.
 
 **Apply.** (1) Land StaticCache. (2) `torch.compile(model, mode="reduce-overhead", fullgraph=True)` over the expert forward → auto CUDA graphs + RoPE/RMSNorm fusion; escalate to `max-autotune` for the deployed build. (3) If overhead persists, manually capture the K-step loop (static input/output buffers, side-stream warmup; cache VLM prefix K/V before capture; pass `getCurrentCUDAStream()` to any custom kernel or capture silently breaks).
 
@@ -112,6 +147,8 @@ Cross-ref: `TRAIN_SPEED_UP.md` covers `reduce-overhead`/CUDA-graphs for *trainin
 ### 4.2 Attention: replace eager fp32-upcast with SDPA/FA-2 — rank #3
 
 `get_attention_interface` returns `eager_attention_forward` (fp32-upcast matmul) on **both** prefix and **every denoise step**. SDPA (dispatching to a fused/FA-style kernel) or FlashAttention-2 (sm_86/sm_87, fp16/bf16) cuts the dominant per-step attention. The action-suffix sequence is short, so the *per-step* win is modest, but it lands on 82% of the budget × K and on the prefix. **FlashAttention-3 is Hopper-only (WGMMA/TMA/FP8) — does not transfer to Ampere; drop it.** Low LOC, no retrain.
+
+> **MEASURED (2026-06-24) — ~0 gain at bs=1.** This is the §4.1 Nsight go/no-go resolving to **overhead-bound, not compute-bound**: at bs=1 the per-step cost is kernel-launch + Python dispatch, not the matmul, so a fused kernel saves nothing until the launches are eliminated (CUDA-graphs, §4.1). SDPA is *implemented and kept* behind an opt-in env gate (`SAWSEEN_ATTN=sdpa`, `smolvlm_with_expert.py:sdpa_attention_forward`) for the **batched / compute-bound** regime (multi-env eval, sampling, multi-robot serving), where it should pay off — but it is off the single-stream critical path.
 
 ### 4.3 AOTInductor / torch.export — deployment hygiene
 
@@ -203,9 +240,9 @@ All training-free unless noted; all attack a *different* graph region than the d
 | # | Experiment | Hypothesis | Cost | Latency Δ vs 218 ms | Mem Δ vs 450M | Risk to 75% LIBERO-spatial | Platform |
 |---|---|---|---|---|---|---|---|
 | 1 | **Pluggable solver + non-uniform schedule** (Heun/DPM) | K=10→~4–6 free | ~100 LOC, 0 GPU-h | 218 → ~100–130 ms | 0 | ~0 (ceiling K≈4) | both |
-| 2 | **StaticCache + CUDA-graph denoise step** (gate on Nsight) | kill launch overhead × K at bs=1 | ~1 wk, medium LOC | per-step ↓ (profile-dependent) | 0 | 0 | both |
-| 3 | **SDPA/FA-2 in expert** (drop eager fp32 attn) | cut dominant per-step matmul | low LOC | per-step ↓ | small | 0 | both |
-| 4 | **SnapFlow self-distill → K=1–2** | 82% → near-1-step, SR-neutral | ~12 GPU-h, few-hundred LOC | **218 → ~57 ms (K=1) / 74 ms (K=2)** | 0 | small at K=1 (keep K=2–3 chaining fallback) | both |
+| 2 | **✓ DONE — two-graph CUDA capture** (no StaticCache; §1·E) | kill launch overhead × K at bs=1 | ~½ day, ~120 LOC | **55.7 → 25.4 ms (2.20×), bit-exact** | 0 | 0 (SR 79%) | both |
+| 3 | **✗ null at bs=1 — SDPA/FA-2 in expert** | cut dominant per-step matmul | low LOC | **~0 (overhead-bound, not compute-bound)** | small | 0 | batched only |
+| 4 | **⊘ unnecessary on spatial — SnapFlow self-distill → K=1–2** | 82% → near-1-step, SR-neutral | ~12 GPU-h, few-hundred LOC | **K=1 is already free here (no distill); 55.7 ms eager** | 0 | small at K=1 (keep K=2–3 fallback for harder suites) | both |
 | 5 | **RTC deployment sweep** (+ joint w/ distilled K) | hide latency; verify inpaint budget at low K | config, ~days | hides, ~20% faster motion | 0 | neutral; **flag K=1+RTC interaction** | both |
 | 6 | **Re-plan freq g≈0.5–0.6** | avoid 51.8% open-loop cliff | config | none (correctness) | 0 | **+** (avoids cliff) | both |
 | 7 | **INT4-AWQ on VLM** | Orin unified-pool memory | low (bnb/AWQ) | ~0 (maybe negative) | **VLM weights 4×** | ~0 (validate) | Orin |
@@ -217,12 +254,12 @@ All training-free unless noted; all attack a *different* graph region than the d
 
 | Stage | 3090 Ti (bs=1) | AGX Orin (est., full power) |
 |---|---|---|
-| Baseline K=10 | 218 ms (4.6 chunks/s) | ~0.7–1.0 s/chunk (~1–1.5 Hz) |
+| Baseline K=10 | 218 ms (4.6 chunks/s) — *measured* | ~0.7–1.0 s/chunk (~1–1.5 Hz) |
 | + Tier-1 solver (K≈5) | ~128 ms | ~0.4–0.5 s/chunk |
-| + SnapFlow K=1 | **~57 ms (17.5 chunks/s)** | **~120–250 ms/chunk (~4–8 Hz)** |
-| + CUDA-graph/SDPA/INT8-expert | **<40 ms** (overhead removed) | **<150 ms/chunk**, lower power | 
+| **K=1 (no distill needed)** | **55.7 ms (18 chunks/s) — *measured, SR 77%*** | **~120–250 ms/chunk (~4–8 Hz)** |
+| **+ two-graph CUDA capture** | **25.4 ms (39 chunks/s) — *measured, bit-exact, SR 79%*** | **<150 ms/chunk** (est.), lower power |
 
-With chunking + async, both rows are well above controller rate for manipulation; the Orin K=1 row is what makes contact-rich/reactive tasks (200–500 ms plan horizon) tractable on-robot.
+3090 numbers are now measured (not estimated): two-graph K=1 = **25.4 ms, 8.6× over baseline**, no distillation, no INT8, no SDPA. The Orin column remains estimated — the §7 read-across (~5× the desktop per-step) is unverified on-device and is the main open item. With chunking + async, both 3090 rows are well above controller rate for manipulation; the Orin K=1 row is what makes contact-rich/reactive tasks (200–500 ms plan horizon) tractable on-robot.
 
 **Sequencing logic:** #1/#3/#6 are same-day, zero-risk. #2 gated on Nsight. #4 is the headline and should start in parallel with #1 (use #1 as its eval harness). #5 must be validated *jointly* with #4 (the RTC-at-low-K open question). #7/#8 are Orin-only memory/edge plays — #8 strictly A/B'd per-block.
 
@@ -264,4 +301,6 @@ With chunking + async, both rows are well above controller rate for manipulation
 - OxyGen (Thor-class — magnitudes not Ampere-transferable) — https://arxiv.org/abs/2603.14371 · vla.cpp (SmolVLA 28.16 ms RTX 3060 / 141.81 ms Orin Nano) — https://arxiv.org/abs/2606.08094 · Spec-VLA (AR-only) — https://arxiv.org/abs/2507.22424
 - OpenVLA-OFT (parallel decode, 26×, 97.1% LIBERO) — https://arxiv.org/abs/2502.19645 · VLA-Cache — https://arxiv.org/abs/2502.02175 · ADP — https://arxiv.org/abs/2509.22093 · VLA-Pruner — https://arxiv.org/abs/2511.16449 · CLP "Fewer Layers Than You Think" — https://arxiv.org/abs/2606.20246 · FastVLM — https://arxiv.org/abs/2412.13303 · ToMe — https://arxiv.org/abs/2210.09461
 
-*Local code anchors: `smolvla/modeling_smolvla.py` — `sample_actions:812` (prefix cached once `:836`; fixed Euler `:845/:876`), `denoise_step:883` (cache re-read `:904`), `embed_image`. `smolvla/smolvlm_with_expert.py` — layer truncation `:102`, dynamic-cache StaticCache TODO `:272/:276`, eager attn interface. `smolvla/configuration_smolvla.py` — `use_cache`, `num_steps`, `num_vlm_layers=16`, `self_attn_every_n_layers=2`, `compile_model`, `rtc_config`. `rtc/configuration_rtc.py`.*
+*Local code anchors: `smolvla/modeling_smolvla.py` — `sample_actions:812` (prefix cached once `:836`; fixed Euler `:845/:876`), `denoise_step:883` (cache re-read `:904`), `embed_image`. `smolvla/smolvlm_with_expert.py` — layer truncation `:102`, dynamic-cache StaticCache TODO `:272/:276`, eager attn interface, opt-in `sdpa_attention_forward` (env `SAWSEEN_ATTN=sdpa`). `smolvla/configuration_smolvla.py` — `use_cache`, `num_steps`, `num_vlm_layers=16`, `self_attn_every_n_layers=2`, `compile_model`, `rtc_config`. `rtc/configuration_rtc.py`.*
+
+*Shipped optimization (the 25.4 ms result, §1·E / §4.1 MEASURED): `sawseenvla/modeling_sawseenvla.py` — `_sample_actions_graphed` (two chained CUDA graphs sharing a persistent `static_cache`) + `_capture_inference_graphs`, gated `SAWSEEN_CUDAGRAPH=1` (inference-only, RTC-disabled); `embed_suffix` host→device-sync removal (`torch.tensor`→`torch.ones`). Bench: single-process eager-vs-graphed with bit-exact check. Eval: `lerobot-eval … --policy.num_steps=1` with `SAWSEEN_CUDAGRAPH=1`, `libero_spatial`, 100 ep → pc_success 79.0.*

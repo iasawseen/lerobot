@@ -13,10 +13,12 @@
 # limitations under the License.
 
 import copy
+import os
 from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
+from torch.nn import functional as F  # noqa: N812
 
 from lerobot.utils.import_utils import _transformers_available, require_package
 
@@ -524,8 +526,48 @@ class SmolVLMWithExpertModel(nn.Module):
         return outputs_embeds, past_key_values
 
     def get_attention_interface(self):
+        # Opt-in fused SDPA path (env SAWSEEN_ATTN=sdpa) — SR-neutral, faster
+        # kernel than the fp32-upcast eager loop. Default stays eager so other
+        # policies / training are unchanged.
+        if os.environ.get("SAWSEEN_ATTN", "").lower() == "sdpa":
+            return self.sdpa_attention_forward
         attention_interface = self.eager_attention_forward
         return attention_interface
+
+    def sdpa_attention_forward(
+        self, attention_mask, batch_size, head_dim, query_states, key_states, value_states
+    ):
+        """Fused SDPA equivalent of eager_attention_forward.
+
+        Same I/O contract: q (B,Lq,H,D), k/v (B,Lkv,Hkv,D), bool mask
+        (B,Lq,Lkv) True=attend; returns (B,Lq,H*D). GQA expanded manually to
+        match the eager path; bool mask semantics (True=participate) match
+        SDPA's, so this is numerically equivalent up to fused-kernel precision.
+        """
+        num_att_heads = self.num_attention_heads
+        num_key_value_heads = self.num_key_value_heads
+        num_key_value_groups = num_att_heads // num_key_value_heads
+        seq_len = key_states.shape[1]
+
+        key_states = key_states[:, :, :, None, :].expand(
+            batch_size, seq_len, num_key_value_heads, num_key_value_groups, head_dim
+        ).reshape(batch_size, seq_len, num_key_value_heads * num_key_value_groups, head_dim)
+        value_states = value_states[:, :, :, None, :].expand(
+            batch_size, seq_len, num_key_value_heads, num_key_value_groups, head_dim
+        ).reshape(batch_size, seq_len, num_key_value_heads * num_key_value_groups, head_dim)
+
+        # (B, L, H, D) -> (B, H, L, D)
+        q = query_states.transpose(1, 2)
+        k = key_states.transpose(1, 2)
+        v = value_states.transpose(1, 2)
+        attn_mask = attention_mask[:, None, :, :]  # (B,1,Lq,Lkv) bool, True=attend
+
+        att_output = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        # (B, H, Lq, D) -> (B, Lq, H*D)
+        att_output = att_output.transpose(1, 2).reshape(
+            batch_size, -1, num_key_value_heads * num_key_value_groups * head_dim
+        )
+        return att_output
 
     def eager_attention_forward(
         self, attention_mask, batch_size, head_dim, query_states, key_states, value_states
