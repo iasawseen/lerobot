@@ -318,18 +318,37 @@ docker run --rm --runtime nvidia --ipc=host \
 Full protocol: drop `--env.task_ids`, set `--eval.n_episodes=10 --eval.batch_size=10`
 (→ 100 episodes). NOTE: a full Orin eval is long (sim + policy); confirm scope first.
 
-> **STATUS (2026-06-25):** EGL render validated on-device, image-build recipe + asset
-> staging + entrypoint all in place and committed (`d125a776`). The end-to-end SR run was
-> in progress at time of writing (libero image build converging through link drops); the
-> on-device SR number is the one remaining TODO.
+> **STATUS (2026-06-25):** WORKS end-to-end on-device. Image builds clean (~4 min);
+> EGL sim runs in the forked async workers on Tegra; the optimized policy
+> (`SAWSEEN_CUDAGRAPH=1`, K=1) controls the robot and solves the task — smoke eval
+> (libero_spatial task 0) = **pc_success 100% on 2/2 episodes**, ~23 s/episode, video
+> written via `av`. The full 100-episode protocol was running at time of writing for the
+> definitive SR (comparable to the 3090's 79%). Two device-specific build blockers had to
+> be fixed first — see §3.5b and §5.9/§5.10.
 
-### 3.5 Lossy-link build resilience (load-bearing on this device)
-A bare `pip install` aborts the whole layer on one truncated wheel (`BrokenPipeError` /
-`incomplete-download`). `Dockerfile.orin.libero` therefore uses
-`RUN --mount=type=cache,target=/root/.cache/pip pip install --retries 10 --timeout 180 …`
-(needs `# syntax=docker/dockerfile:1` at the top). Re-running the build **resumes** from
-the cache — wrap it in a retry loop and it converges. Same idea for transfers: always
-`rsync --partial`.
+### 3.5 The two build blockers that actually mattered (don't waste a day on these)
+The libero pip layer failed repeatedly until two device-specific issues were fixed — both
+now baked into `Dockerfile.orin.libero`:
+
+**(a) The pip index proxy, not the link.** The base image's default index is the
+**Jetson-AI-Lab PyPI proxy** (`pypi.jetson-ai-lab.io`). Its passthrough for *general*
+packages served **0 bytes/s** here (the build stalled forever on the 3.2 MB `hf-libero`
+wheel; `--retries`/`--resume-retries` couldn't help because nothing transferred). The
+Orin's *direct* path to PyPI is fine — `files.pythonhosted.org` HEAD = 0.22 s, and the
+same wheel downloads at **~27 MB/s** with `pip install --index-url https://pypi.org/simple/`.
+That flag is the fix. torch/torchvision/numpy come from the base image and are pinned via
+the constraints file, so no Jetson-specific wheel is ever fetched from PyPI. *Diagnostic:
+look at the failing download URL — if it's `pypi.jetson-ai-lab.io/...`, you've found it.*
+
+**(b) A broken venv cmake shim.** `egl-probe`/`hf-egl-probe` are sdist-only and CMake-build
+at install. The base venv ships `/opt/venv/bin/cmake` doing `from cmake import cmake` with
+no such module — it shadows the real apt `/usr/bin/cmake` on PATH, so the build dies with
+`ModuleNotFoundError: No module named 'cmake'`. Fix: `rm -f /opt/venv/bin/cmake` (and
+`ninja`) so the apt binaries win.
+
+Lesser hygiene (kept, but NOT the fix): a BuildKit pip cache mount
+(`RUN --mount=type=cache,target=/root/.cache/pip …`, needs `# syntax=docker/dockerfile:1`)
+so wheels persist across rebuilds, and `rsync --partial` for all transfers.
 
 ### 3.6 EGL-on-Tegra fix (the make-or-break gotcha)
 The Tegra ships only the *vendor* `libEGL_nvidia.so.0`, not the glvnd dispatch
@@ -374,8 +393,10 @@ object has no attribute 'eglQueryString'`. Closing the gap (baked into
 1. Orin root FS full → stage on `/mnt/nvme`; point HF_HOME/caches there.
 2. Checkpoint is self-contained → `load_vlm_weights=false`, ship only SmolVLM2 small files (saves 1.9 GB).
 3. EGL on Tegra needs the **glvnd loader** + `NVIDIA_DRIVER_CAPABILITIES=all` + vendor ICD dir (§3.6).
-4. Lossy link → BuildKit pip cache mount + retry loop; `rsync --partial`.
-5. Two graphs, not one — a single combined CUDA graph replays stale K/V (26% SR). Verify with a 2-input diagnostic.
-6. `torchcodec` is unavailable on aarch64 → eval video via `av`.
-7. nvcr.io base (~15 GB) is impractical to pull on a slow link → `BASE_IMAGE` ARG falls back to the on-device dustynv Jetson torch image.
-8. Device may reboot under load → NVMe staging persists; re-check `ping`/ssh.
+4. **pip index proxy stalls at 0 B/s** → `pip install --index-url https://pypi.org/simple/` (the base image points pip at the Jetson-AI-Lab proxy; go direct — §3.5a). This was *the* libero-build blocker, not the link.
+5. **Broken venv cmake shim** shadows apt cmake → `egl-probe` build fails `No module named 'cmake'`; `rm -f /opt/venv/bin/cmake /opt/venv/bin/ninja` (§3.5b).
+6. Two graphs, not one — a single combined CUDA graph replays stale K/V (26% SR). Verify with a 2-input diagnostic.
+7. `torchcodec` is unavailable on aarch64 → eval video via `av`.
+8. EGL on Tegra needs the **glvnd loader** + `NVIDIA_DRIVER_CAPABILITIES=all` + vendor ICD dir (§3.6). The libero env's first `import libero` calls `input()` unless `~/.libero/config.yaml` exists → the entrypoint writes it first.
+9. nvcr.io base (~15 GB) is impractical to pull on a slow link → `BASE_IMAGE` ARG falls back to the on-device dustynv Jetson torch image.
+10. Device may reboot under load → NVMe staging persists; re-check `ping`/ssh. Lossy link → BuildKit pip cache mount; `rsync --partial`.
