@@ -1,6 +1,6 @@
 # SawSeenVLA — Inference & Deployment Optimization
 
-*Companion to `design/TRAIN_SPEED_UP.md` (training-throughput). This doc is inference/deployment-only. Where a lever overlaps with training, it is cross-referenced, not repeated.*
+*Companion to `design/TRAIN_SPEED_UP.md` (training-throughput). This doc is inference/deployment-only. Where a lever overlaps with training, it is cross-referenced, not repeated. For the step-by-step reproduction runbook (RTX 3090 + Jetson Orin: exact commands, staging, Dockerfiles, EGL-on-Tegra fix), see `design/SAWSEENVLA_OPT_REPRODUCE.md`.*
 
 Target object: ~450M VLA — frozen SmolVLM2-500M backbone (first 16 of 32 layers, PixelShuffle → 64 vision-tokens/frame, `self_attn_every_n_layers=2`) + flow-matching action expert, K=10 Euler denoise, chunk_size=50, bf16. Serving targets: RTX 3090/3090 Ti (sm_86, dev + desktop) and Jetson AGX Orin 64 GB (sm_87, on-robot). Both Ampere ⇒ **bf16/fp16/INT8 tensor cores, no FP8, no useful hardware INT4.** Every recommendation is constrained to that precision envelope.
 
