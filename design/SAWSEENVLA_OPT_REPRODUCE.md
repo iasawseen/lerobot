@@ -73,6 +73,114 @@ Three changes, all behind env gates (default off → other policies/training unc
 | CUDA-graph path | env `SAWSEEN_CUDAGRAPH=1` | the 2.2–2.7× launch-overhead win, bit-exact |
 | fused attention | env `SAWSEEN_ATTN=sdpa` | batched only; ~0 at bs=1 |
 
+### 1.4 CUDA-graph cookbook (annotated code)
+
+**(a) The reusable capture→replay recipe.** Any fixed-shape, launch-overhead-bound region
+(bs=1 transformer steps, denoise loops) graphs with this pattern:
+```python
+import torch
+
+# 1) STATIC buffers — fixed addresses & shapes. The graph records pointers, not values;
+#    you feed new data by copy_-ing INTO these buffers, never by reassigning them.
+static_in = example_input.clone()
+static_out = None
+
+# 2) Warm up on a SIDE stream (lazy-inits cuBLAS/cuDNN handles + the caching allocator
+#    so capture doesn't record one-time setup). 3 iters is enough here.
+s = torch.cuda.Stream(); s.wait_stream(torch.cuda.current_stream())
+with torch.cuda.stream(s):
+    for _ in range(3):
+        static_out = fn(static_in)
+torch.cuda.current_stream().wait_stream(s)
+
+# 3) Capture the kernel-launch sequence once.
+g = torch.cuda.CUDAGraph()
+with torch.cuda.graph(g):
+    static_out = fn(static_in)
+
+# 4) Replay: copy fresh data in, replay, read out (clone — static_out is overwritten next replay).
+static_in.copy_(new_input)
+g.replay()
+result = static_out.clone()
+```
+Do it all under `torch.no_grad()` (inference). Re-capture if any input *shape* changes.
+
+**(b) Capture blockers — the `embed_suffix` fix.** A hidden host→device sync silently
+breaks capture. The denoise step built an attention mask from a Python list every step:
+```python
+# BEFORE — torch.tensor(python_list, device=...) is a per-step H2D sync (un-capturable):
+att_masks = torch.tensor(att_masks, dtype=embs.dtype, device=embs.device)
+# AFTER — build it natively on-device (here att_masks is just an all-ones constant vector):
+n_att = len(att_masks)
+att_masks = torch.ones(n_att, dtype=embs.dtype, device=embs.device)
+att_masks = att_masks[None, :].expand(bsize, n_att)
+```
+Hunt for these before capturing: `torch.tensor(list)`, `.to(device=...)` of host data,
+`.item()`, `.cpu()`, `print`, `torch.cuda.synchronize()`, and data-dependent shapes.
+
+**(c) The two-graph pattern (the actual implementation).** The prefix forward and the
+denoise loop are captured as **two graphs sharing one persistent `static_cache`**. Capture
+(`_capture_inference_graphs`): one eager forward sizes the cache, then graph 1 recomputes
+K/V **in-place** into it, graph 2 reads it — both warmed on a side stream first:
+```python
+# static_cache allocated once from an eager forward; graph 1 overwrites it in place.
+def _fwd():                                   # graph 1: VLM prefix forward
+    _, pkv = self.vlm_with_expert.forward(
+        attention_mask=s_att2d, position_ids=s_pos, past_key_values=None,
+        inputs_embeds=[s_embs, None], use_cache=self.config.use_cache, fill_kv_cache=True)
+    for li, kv in pkv.items():                # IN-PLACE copy → cache addresses stay fixed
+        static_cache[li]["key_states"].copy_(kv["key_states"])
+        static_cache[li]["value_states"].copy_(kv["value_states"])
+
+def _step():                                  # graph 2: one flow-denoise step, reads static_cache
+    return self.denoise_step(x_t=s_xt, prefix_pad_masks=s_pad,
+                             past_key_values=static_cache, timestep=s_ts)
+
+strm = torch.cuda.Stream(); strm.wait_stream(torch.cuda.current_stream())
+with torch.cuda.stream(strm):
+    for _ in range(3): _fwd(); _step()        # warm BOTH on the side stream
+torch.cuda.current_stream().wait_stream(strm)
+
+fwd_graph = torch.cuda.CUDAGraph()
+with torch.cuda.graph(fwd_graph): _fwd()
+step_graph = torch.cuda.CUDAGraph()
+with torch.cuda.graph(step_graph): static_vt = _step()
+```
+Replay per inference call (`_sample_actions_graphed`) — vision encode stays eager:
+```python
+prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(...)  # EAGER (HF vision)
+cg["embs"].copy_(prefix_embs); cg["att2d"].copy_(...); cg["pos"].copy_(...)
+cg["fwd_graph"].replay()                      # recomputes static_cache for THESE inputs
+x_t = noise
+for step in range(num_steps):                 # K-step Euler denoise
+    cg["xt"].copy_(x_t); cg["ts"].fill_(1.0 + step * dt)
+    cg["step_graph"].replay()                 # reads the just-filled static_cache
+    x_t = x_t + dt * cg["vt"]                  # Euler update in Python between replays
+```
+Full source: `modeling_sawseenvla.py::_capture_inference_graphs / _sample_actions_graphed`.
+
+**(d) Why two graphs, not one — and how to catch the bug.** A single combined graph
+captures the K/V *values* and replays them stale for new inputs → wrong actions (we measured
+**26% SR**). Splitting forces graph 1 to recompute the cache each call. Verify with a
+**2-input diagnostic** — the test that distinguishes "bit-exact" from "replaying stale state":
+```python
+oA_e, oA_g = eager(inA), graphed(inA)
+oB_e, oB_g = eager(inB), graphed(inB)
+assert (oA_e - oA_g).abs().max() < 1e-2   # graphed == eager on input A
+assert (oB_e - oB_g).abs().max() < 1e-2   # graphed == eager on input B  ← fails if stale-replay
+assert (oA_g - oB_g).abs().max() > 1e-1   # A != B  ← fails if graph ignores new input
+```
+On both the 3090 and the Orin this gives max |Δ| = 0.000000 (bit-exact).
+
+**(e) Env-swappable fused attention (`SAWSEEN_ATTN=sdpa`).** Same trick for an opt-in kernel
+swap that leaves the default path untouched:
+```python
+def get_attention_interface(self):
+    if os.environ.get("SAWSEEN_ATTN", "").lower() == "sdpa":
+        return self.sdpa_attention_forward          # F.scaled_dot_product_attention
+    return self.eager_attention_forward             # default fp32-upcast path
+```
+
 ---
 
 ## 2. Reproduce on RTX 3090 / 3090 Ti
