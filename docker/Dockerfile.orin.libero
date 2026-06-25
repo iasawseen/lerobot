@@ -1,0 +1,64 @@
+# syntax=docker/dockerfile:1
+# LIBERO eval image for Jetson AGX Orin — extends docker/Dockerfile.orin with the
+# LIBERO simulation stack so `lerobot-eval --env.type=libero` runs on-device.
+#
+# Adds: the glvnd EGL loader + dev headers (PyOpenGL needs libEGL.so.1; egl-probe /
+# hf-egl-probe are sdist-only CMake builds that need EGL headers), cmake/ninja/
+# build-essential for those source builds, ffmpeg for eval video, and the hf-libero
+# sim stack (pulls robosuite 1.4.0 / robomimic / bddl / mujoco / hf-egl-probe).
+# torchcodec is unavailable on aarch64 (platform-gated), so eval video goes through av.
+#
+# Headless rendering on Tegra (validated on this device): MUJOCO_GL=egl with the
+# glvnd loader routed to the L4T EGL ICD via __EGL_VENDOR_LIBRARY_DIRS, and the
+# `graphics` driver capability so the nvidia runtime mounts the Tegra GL libs.
+#
+# Build (on the Orin, after building lerobot-orin from Dockerfile.orin):
+#   docker build -f Dockerfile.orin.libero -t lerobot-orin-libero .
+#
+# Run an eval (checkpoint + HF cache + libero assets staged on the NVMe). The
+# companion orin_libero_eval.sh writes ~/.libero/config.yaml and symlinks the
+# staged assets into the package dir before launching, so no network is needed:
+#   docker run --rm --runtime nvidia --ipc=host \
+#     -e HF_HUB_OFFLINE=1 -e SAWSEEN_CUDAGRAPH=1 \
+#     -v <repo>/src:/lerobot/src \
+#     -v /mnt/nvme/lerobot-bench/ckpt:/ckpt:ro \
+#     -v /mnt/nvme/lerobot-bench/hf:/hf \
+#     -v /mnt/nvme/lerobot-bench/libero-assets:/libero-assets:ro \
+#     -v /mnt/nvme/lerobot-bench/orin_libero_eval.sh:/workspace/orin_libero_eval.sh \
+#     lerobot-orin-libero bash /workspace/orin_libero_eval.sh \
+#       --policy.path=/ckpt --policy.device=cuda --policy.num_steps=1 \
+#       --env.type=libero --env.task=libero_spatial --eval.n_episodes=10 --eval.batch_size=10
+
+ARG BASE_IMAGE=lerobot-orin
+FROM ${BASE_IMAGE}
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      libegl1 libgles2 libglvnd0 libopengl0 libegl1-mesa-dev libgl1-mesa-dev \
+      libglib2.0-0 ffmpeg cmake ninja-build build-essential pkg-config git \
+ && rm -rf /var/lib/apt/lists/*
+
+# Protect only the Jetson torch/torchvision builds; let numpy float so numba /
+# robosuite can resolve a compatible version (the base's numpy pin would otherwise
+# conflict with numba's upper bound).
+RUN python3 - <<'PY' > /tmp/torch-constraints.txt
+import torch, torchvision
+print(f"torch=={torch.__version__.split('+')[0]}")
+print(f"torchvision=={torchvision.__version__.split('+')[0]}")
+PY
+
+# This device's uplink is slow and truncates large-wheel downloads mid-stream. A
+# BuildKit pip cache mount makes downloads RESUMABLE across rebuilds: each attempt
+# keeps the wheels already fetched and only re-downloads what's missing, so the layer
+# converges even on a lossy link (re-run the build until it succeeds). --retries/
+# --timeout smooth over transient drops within a single attempt.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --retries 10 --timeout 180 -c /tmp/torch-constraints.txt \
+      "hf-libero>=0.1.3,<0.2.0" \
+      "av>=15,<16" \
+      "scipy>=1.14,<2"
+
+ENV MUJOCO_GL=egl \
+    PYOPENGL_PLATFORM=egl \
+    MUJOCO_EGL_DEVICE_ID=0 \
+    NVIDIA_DRIVER_CAPABILITIES=all \
+    __EGL_VENDOR_LIBRARY_DIRS=/usr/lib/aarch64-linux-gnu/tegra-egl
