@@ -52,7 +52,7 @@ Speedups: two-graph is **2.20× over eager K=1**, **8.6× over the K=10 baseline
 - **SDPA in the expert (§4.2, ranked #3) gave ~0 at bs=1.** The per-step cost is `cudaLaunchKernel` + Python dispatch, *not* the attention matmul — overhead-bound, not compute-bound — so a faster kernel buys nothing until the launches themselves are removed (which CUDA-graphs do). Kept as an opt-in env gate (`SAWSEEN_ATTN=sdpa`) for the batched/compute-bound regime where it should help.
 - **`torch.compile(mode="reduce-overhead")` on the whole model gave 0** — it graph-broke on the dict-typed KV-cache (option (2) in §4.1). The **manual two-graph capture (option (3)) was therefore the necessary path, not a fallback.**
 
-**Net correction to the roadmap (§9):** for `libero_spatial` the binding sequence was **K-reduction (free) → manual two-graph CUDA capture (no StaticCache, no retrain) → 25.4 ms.** Distillation (#4), SDPA (#3), `torch.compile`, and the StaticCache refactor were *not* on the critical path. Implementation is gated behind `SAWSEEN_CUDAGRAPH=1` (inference-only, RTC-disabled) in `sawseenvla/modeling_sawseenvla.py` (`_sample_actions_graphed` / `_capture_inference_graphs`); the `embed_suffix` per-step host→device sync (`torch.tensor(att_masks)`) was also replaced with a native `torch.ones` so the step is capturable. **Still open:** Orin re-measurement (§7 estimates unverified on-device), and per-suite K=1 SR for the harder LIBERO suites.
+**Net correction to the roadmap (§9):** for `libero_spatial` the binding sequence was **K-reduction (free) → manual two-graph CUDA capture (no StaticCache, no retrain) → 25.4 ms.** Distillation (#4), SDPA (#3), `torch.compile`, and the StaticCache refactor were *not* on the critical path. Implementation is gated behind `SAWSEEN_CUDAGRAPH=1` (inference-only, RTC-disabled) in `sawseenvla/modeling_sawseenvla.py` (`_sample_actions_graphed` / `_capture_inference_graphs`); the `embed_suffix` per-step host→device sync (`torch.tensor(att_masks)`) was also replaced with a native `torch.ones` so the step is capturable. **Orin now measured** (2026-06-25, MAXN): optimized **66.8 ms (15 Hz), 11.0× over the 734 ms K=10 baseline, bit-exact** — beats the §7 <150 ms estimate (details in §7 MEASURED, repro in `docker/Dockerfile.orin`). **Still open:** per-suite K=1 SR for the harder LIBERO suites (object/goal/10) and Orin INT8/energy.
 
 ---
 
@@ -215,6 +215,8 @@ bs=10 = 30 ms/sample. Relevant for multi-env eval, sampling-based action selecti
 
 **Realistic latency/power for the 450M flow loop on Orin.** Anchors: π0 (~3B) measures **920.6 ms / 1.09 Hz / 1.867 kJ per inference** on AGX Orin; SmolVLA-450M-class runs **~2 Hz** raw; vla.cpp times SmolVLA at **28.16 ms/step on RTX 3060 and 141.81 ms/step on Orin Nano** (≈5× the desktop per-step). Read-across to the reference 3090-Ti 17.9 ms/step: expect roughly **~70–100 ms/step on AGX Orin** at the full power budget ⇒ **K=10 ≈ 0.7–1.0 s/chunk raw.** That is sub-real-time per-replan; it is made deployable by (a) **action chunking** (one chunk ≈ 0.2–1.0 s of motion executed at 30–50 Hz controller rate) and (b) **async** (overlap next inference with current execution). **Tier-1 distillation to K=1 collapses that to ~120–250 ms/chunk on Orin** — the difference between "sub-real-time" and "responsive."
 
+> **MEASURED on AGX Orin 64 GB (2026-06-25, MAXN + jetson_clocks, bs=1, 512², bf16, in `docker/Dockerfile.orin`).** K=10 eager = **734 ms (1.36 Hz)** — at the optimistic end of the 0.7–1.0 s estimate. K=1 eager = **180 ms (5.55 Hz)** — no distillation needed (the K=1-is-free finding, §1·E, holds on-device). K=1 two-graph (optimized) = **66.8 ms (15.0 Hz)** — bit-exact to eager (Δ=0.000000), **beating the <150 ms estimate**. The implied per-denoise-step cost is ~62 ms (from K=10 vs K=1 eager), i.e. ~3.4× the 3090-Ti's 17.9 ms — milder than the ~5× vla.cpp read-across. End-to-end **734 → 67 ms = 11.0×**, decomposed 4.07× (K-reduction) × 2.70× (CUDA-graph). The CUDA-graph win transfers to sm_87 undiminished. Open item downgraded: Orin latency is now verified; INT8-via-TRT on the expert (§5.3) and energy/power per inference remain unmeasured.
+
 **Power.** 15 / 30 / 50 W / MAXN ~60 W. MAXN ~doubles the rate at ~4× the watts; **30–50 W is the realistic sustained envelope on a battery platform.** Energy/inference (1.867 kJ for π0) is the honest edge metric — distillation cuts it ~linearly with K.
 
 **DLA viability.** The 2× NVDLA v2 are INT8/FP16-only and **cannot run transformer/attention layers** (JetPack 6.2) — the expert runs on the Orin GPU via TRT; DLA is only useful to offload conv/vision sub-nets. Don't plan the expert on DLA.
@@ -252,14 +254,14 @@ All training-free unless noted; all attack a *different* graph region than the d
 
 **Per-platform target-latency table.**
 
-| Stage | 3090 Ti (bs=1) | AGX Orin (est., full power) |
+| Stage | 3090 Ti (bs=1) | AGX Orin 64 GB (bs=1, MAXN) |
 |---|---|---|
-| Baseline K=10 | 218 ms (4.6 chunks/s) — *measured* | ~0.7–1.0 s/chunk (~1–1.5 Hz) |
-| + Tier-1 solver (K≈5) | ~128 ms | ~0.4–0.5 s/chunk |
-| **K=1 (no distill needed)** | **55.7 ms (18 chunks/s) — *measured, SR 77%*** | **~120–250 ms/chunk (~4–8 Hz)** |
-| **+ two-graph CUDA capture** | **25.4 ms (39 chunks/s) — *measured, bit-exact, SR 79%*** | **<150 ms/chunk** (est.), lower power |
+| Baseline K=10 | 218 ms (4.6 chunks/s) — *measured* | **734 ms (1.36 chunks/s) — *measured*** |
+| + Tier-1 solver (K≈5) | ~128 ms | ~430 ms (interpolated) |
+| **K=1 (no distill needed)** | **55.7 ms (18 chunks/s) — *measured, SR 77%*** | **180 ms (5.55 chunks/s) — *measured*** |
+| **+ two-graph CUDA capture** | **25.4 ms (39 chunks/s) — *measured, bit-exact, SR 79%*** | **66.8 ms (15.0 chunks/s) — *measured, bit-exact*** |
 
-3090 numbers are now measured (not estimated): two-graph K=1 = **25.4 ms, 8.6× over baseline**, no distillation, no INT8, no SDPA. The Orin column remains estimated — the §7 read-across (~5× the desktop per-step) is unverified on-device and is the main open item. With chunking + async, both 3090 rows are well above controller rate for manipulation; the Orin K=1 row is what makes contact-rich/reactive tasks (200–500 ms plan horizon) tractable on-robot.
+Both platforms are now measured (not estimated). On AGX Orin (MAXN + jetson_clocks) the **optimized path is 66.8 ms — 11.0× over the 734 ms K=10 baseline**, decomposing as **4.07× (K=10→K=1, free) × 2.70× (two-graph CUDA capture)**, bit-exact to eager (Δ=0.000000) just as on the 3090. This **beats the doc's earlier <150 ms estimate** and lands the policy at ~15 Hz single-stream on-robot. Orin runs ~2.6–3.4× the 3090 Ti latency config-for-config; the implied per-denoise-step cost is ~62 ms on Orin vs 17.9 ms on the 3090 (~3.4×, milder than the §7 ~5× read-across). With chunking + async, both platforms clear controller rate for manipulation; the Orin optimized row is what makes contact-rich/reactive tasks (200–500 ms plan horizon) tractable on-robot.
 
 **Sequencing logic:** #1/#3/#6 are same-day, zero-risk. #2 gated on Nsight. #4 is the headline and should start in parallel with #1 (use #1 as its eval harness). #5 must be validated *jointly* with #4 (the RTC-at-low-K open question). #7/#8 are Orin-only memory/edge plays — #8 strictly A/B'd per-block.
 

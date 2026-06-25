@@ -1,0 +1,63 @@
+# SawSeenVLA inference image for NVIDIA Jetson AGX Orin / Thor — JetPack 6.2 (L4T R36.4.x), aarch64.
+#
+# Derives from NVIDIA's NGC iGPU PyTorch container (CUDA-enabled torch built for
+# the Tegra iGPU, sm_87) and adds only the LeRobot runtime dependencies needed to
+# import and run the `sawseenvla` policy for inference. torch / torchvision / numpy
+# ship in the base image and must NOT be replaced — a PyPI torch has no Jetson CUDA
+# build — so a constraints file pins them to whatever the base provides.
+#
+# The lerobot source and the benchmark script (docker/bench_orin.py, its companion)
+# are MOUNTED at runtime rather than COPYed in (matching sawseenvla.mk), so iterating
+# on policy code needs no rebuild. bench_orin.py measures the opt-vs-baseline configs
+# (K=10 eager -> K=1 two-graph) with bit-exact checks.
+#
+# Build (on the Orin):
+#   docker build -f Dockerfile.orin -t lerobot-orin .
+#   # base image overridable, e.g. the dustynv build already on the device:
+#   #   --build-arg BASE_IMAGE=pytorch:2.9.1-r36.4.tegra-aarch64-cp312-cu128-24.04
+#
+# Run the opt-vs-baseline benchmark (checkpoint + HF cache staged on the NVMe):
+#   docker run --rm --runtime nvidia --ipc=host \
+#     -v <repo>/src:/lerobot/src \
+#     -v /mnt/nvme/lerobot-bench/ckpt:/ckpt:ro \
+#     -v /mnt/nvme/lerobot-bench/hf:/hf \
+#     -v /mnt/nvme/lerobot-bench/bench_orin.py:/workspace/bench_orin.py \
+#     lerobot-orin python3 bench_orin.py /ckpt
+
+ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:25.06-py3-igpu
+FROM ${BASE_IMAGE}
+
+ENV PYTHONUNBUFFERED=1
+ENV OMP_NUM_THREADS=1
+# lerobot source is mounted here at runtime; HF assets (SmolVLM2 base) staged on NVMe.
+ENV PYTHONPATH=/lerobot/src
+ENV HF_HOME=/hf
+
+WORKDIR /workspace
+
+# Freeze the base CUDA stack so the dependency resolver can't pull a (CPU/x86)
+# replacement over the Jetson builds.
+RUN python3 - <<'PY' > /tmp/base-constraints.txt
+import torch, torchvision, numpy
+for name, mod in (("torch", torch), ("torchvision", torchvision), ("numpy", numpy)):
+    print(f"{name}=={mod.__version__.split('+')[0]}")
+PY
+
+# LeRobot mandatory deps + sawseenvla(smolvla)-family runtime deps, versions per
+# pyproject.toml (transformers is pinned to 5.3.0 for SmolVLM2 support). opencv is
+# installed --no-deps so it cannot drag numpy off the base version.
+RUN pip install --no-cache-dir -c /tmp/base-constraints.txt \
+      "transformers==5.3.0" \
+      "accelerate>=1.10.0,<2.0.0" \
+      "draccus==0.10.0" \
+      "safetensors>=0.4.3,<1.0.0" \
+      "huggingface-hub>=1.0.0,<2.0.0" \
+      "einops>=0.8.0,<0.9.0" \
+      "num2words>=0.5.14,<0.6.0" \
+      "Pillow>=10.0.0,<13.0.0" \
+      "requests>=2.32.0,<3.0.0" \
+      "gymnasium>=1.1.1,<2.0.0" \
+      "packaging>=24.2,<26.0" \
+      "termcolor>=2.4.0,<4.0.0" \
+      "tqdm>=4.66.0,<5.0.0" \
+ && pip install --no-cache-dir --no-deps "opencv-python-headless>=4.11.0,<4.14.0"
