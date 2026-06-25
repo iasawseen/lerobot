@@ -26,12 +26,16 @@ The optimization is **two zero-GPU-h levers**, no distillation / quantization / 
 |---|---:|---:|---|
 | K=10 eager (baseline) | 218 ms | 734.3 ms | 75% |
 | K=1 eager | 55.7 ms | 180.2 ms | 77% |
-| **K=1 two-graph (optimized)** | **25.4 ms** | **66.8 ms** | **79%** |
+| **K=1 two-graph (optimized)** | **25.4 ms** | **66.8 ms** | 3090: **79%** · Orin: **76%** |
 | speedup vs baseline | **8.6×** | **11.0×** | no SR loss |
 
-Orin 11.0× decomposes as **4.07× (K=10→K=1) × 2.70× (CUDA-graph)**. Bit-exactness holds
-on sm_87 exactly as on the 3090. Commits: `ca2de108` (optimization), `c716390a` (Orin
-benchmark + `Dockerfile.orin`), `d125a776` (Orin LIBERO-eval image).
+The SR column is libero_spatial / 100 ep. The optimized policy was eval'd on BOTH platforms
+in the real sim: 3090 **79%**, Orin **76%** (on-device, EGL sim, `SAWSEEN_CUDAGRAPH=1` K=1) —
+both within LIBERO run-to-run variance of each other and above the K=10 baseline (75%), so
+the CUDA-graph optimization is SR-neutral on-device too. Orin 11.0× decomposes as
+**4.07× (K=10→K=1) × 2.70× (CUDA-graph)**; bit-exactness holds on sm_87 exactly as on the
+3090. Commits: `ca2de108` (optimization), `c716390a` (Orin benchmark + `Dockerfile.orin`),
+`d125a776` (Orin LIBERO-eval image), `d28a005a` (libero build fixes).
 
 ---
 
@@ -318,13 +322,14 @@ docker run --rm --runtime nvidia --ipc=host \
 Full protocol: drop `--env.task_ids`, set `--eval.n_episodes=10 --eval.batch_size=10`
 (→ 100 episodes). NOTE: a full Orin eval is long (sim + policy); confirm scope first.
 
-> **STATUS (2026-06-25):** WORKS end-to-end on-device. Image builds clean (~4 min);
-> EGL sim runs in the forked async workers on Tegra; the optimized policy
-> (`SAWSEEN_CUDAGRAPH=1`, K=1) controls the robot and solves the task — smoke eval
-> (libero_spatial task 0) = **pc_success 100% on 2/2 episodes**, ~23 s/episode, video
-> written via `av`. The full 100-episode protocol was running at time of writing for the
-> definitive SR (comparable to the 3090's 79%). Two device-specific build blockers had to
-> be fixed first — see §3.5b and §5.9/§5.10.
+> **STATUS (2026-06-25): DONE — validated end-to-end on-device.** Image builds clean
+> (~4 min); EGL sim runs in the forked async workers on Tegra; the optimized policy
+> (`SAWSEEN_CUDAGRAPH=1`, K=1) controls the robot in the real sim. Full protocol:
+> **pc_success = 76.0% over 100 libero_spatial episodes** (10 tasks × 10 ep, bs=10),
+> ~14 min total (8.65 s/episode). That matches the 3090's K=1 SR (77–79%) within LIBERO
+> variance and is above the K=10 baseline (75%) — the CUDA-graph optimization preserves
+> task success on-device. Two device-specific build blockers had to be fixed first
+> (§3.5).
 
 ### 3.5 The two build blockers that actually mattered (don't waste a day on these)
 The libero pip layer failed repeatedly until two device-specific issues were fixed — both
