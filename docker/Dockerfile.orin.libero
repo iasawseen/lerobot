@@ -46,13 +46,21 @@ print(f"torch=={torch.__version__.split('+')[0]}")
 print(f"torchvision=={torchvision.__version__.split('+')[0]}")
 PY
 
-# This device's uplink is slow and truncates large-wheel downloads mid-stream. A
-# BuildKit pip cache mount makes downloads RESUMABLE across rebuilds: each attempt
-# keeps the wheels already fetched and only re-downloads what's missing, so the layer
-# converges even on a lossy link (re-run the build until it succeeds). --retries/
-# --timeout smooth over transient drops within a single attempt.
+# The base venv ships a BROKEN cmake/ninja launcher (/opt/venv/bin/cmake does
+# `from cmake import cmake` but the module isn't installed) that shadows the real apt
+# /usr/bin/cmake on PATH → egl-probe / hf-egl-probe's sdist CMake build dies with
+# "ModuleNotFoundError: No module named 'cmake'". Drop the shims so apt cmake/ninja win.
+RUN rm -f /opt/venv/bin/cmake /opt/venv/bin/cmake3 /opt/venv/bin/ninja /opt/venv/bin/ninja-build
+
+# --index-url https://pypi.org/simple/ is load-bearing on this device: the base image's
+# default index is the Jetson-AI-Lab PyPI proxy (pypi.jetson-ai-lab.io), whose passthrough
+# stalls at 0 bytes/s for general packages here — going direct to PyPI downloads at ~27 MB/s.
+# (torch/torchvision/numpy come from the base image and are pinned via constraints, so no
+# Jetson-specific wheel is fetched.) The BuildKit pip cache mount + --retries make it robust
+# to transient drops; re-run the build if needed.
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --retries 10 --timeout 180 -c /tmp/torch-constraints.txt \
+    pip install --index-url https://pypi.org/simple/ --retries 10 --timeout 120 \
+      -c /tmp/torch-constraints.txt \
       "hf-libero>=0.1.3,<0.2.0" \
       "av>=15,<16" \
       "scipy>=1.14,<2"
